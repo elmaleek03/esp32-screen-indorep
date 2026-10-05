@@ -57,8 +57,21 @@ bool applyStaticAddress() {
         return false;
     }
 
-    // No DNS server needed: the device is a server, not a client.
-    if (!WiFi.config(ip, gw, mask)) {
+    // A DNS server IS required, even though this device is primarily a server.
+    // The standby clock resolves its NTP servers by hostname, so without DNS the
+    // sync fails and the clock never updates - silently. NET_DNS_SERVER defaults
+    // to the gateway, which normally runs a resolver.
+    IPAddress dns;
+    const bool haveDns = dns.fromString(NET_DNS_SERVER);
+    if (!haveDns) {
+        Serial.printf("[net] WARNING: NET_DNS_SERVER \"%s\" did not parse; "
+                      "NTP hostname lookups will fail\n", NET_DNS_SERVER);
+    }
+
+    // WiFi.config() has several overloads; the 4-arg form adds a DNS server.
+    const bool ok = haveDns ? WiFi.config(ip, gw, mask, dns)
+                            : WiFi.config(ip, gw, mask);
+    if (!ok) {
         Serial.println("[net] ERROR: static address REJECTED by the driver");
         Serial.printf("[net]   requested %s/%s gw %s\n",
                       NET_FALLBACK_ADDR, NET_FALLBACK_MASK, NET_FALLBACK_GW);
@@ -68,8 +81,9 @@ bool applyStaticAddress() {
     snprintf(s_ip, sizeof(s_ip), "%s", NET_FALLBACK_ADDR);
     s_usedFallback = true;
 
-    Serial.printf("[net] static address claimed: %s gw %s mask %s\n",
-                  NET_FALLBACK_ADDR, NET_FALLBACK_GW, NET_FALLBACK_MASK);
+    Serial.printf("[net] static address claimed: %s gw %s mask %s dns %s\n",
+                  NET_FALLBACK_ADDR, NET_FALLBACK_GW, NET_FALLBACK_MASK,
+                  haveDns ? NET_DNS_SERVER : "(none)");
 
     // Say plainly whether the backend can reach us, because this is the single
     // most likely reason a correctly-installed device appears not to work.
@@ -340,9 +354,24 @@ void beginTimeSync() {
     // TZ offset is passed in seconds, matching NTP_TZ_OFFSET_S (WIB, UTC+7).
     // Passing it here means getLocalTime() reports local time, so there is
     // exactly one definition of "local" in the firmware.
-    configTime(NTP_TZ_OFFSET_S, NTP_TZ_DST_S, NTP_SERVER_1, NTP_SERVER_2);
-    Serial.printf("[net] NTP sync started (%s, %s), TZ offset %+ld s\n",
-                  NTP_SERVER_1, NTP_SERVER_2, (long)NTP_TZ_OFFSET_S);
+    //
+    // Three servers is the maximum configTime() accepts. The first two are
+    // hostnames (exercising the normal DNS path) and the third is a raw IP, so
+    // if the network's DNS is broken the clock still has a chance to sync — the
+    // difference between "the clock is wrong" and "the clock works".
+    configTime(NTP_TZ_OFFSET_S, NTP_TZ_DST_S,
+               NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    Serial.printf("[net] NTP sync started (%s, %s, %s), TZ offset %+ld s\n",
+                  NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3,
+                  (long)NTP_TZ_OFFSET_S);
+
+    // Report the DNS server the stack is actually using. A missing or wrong DNS
+    // entry is the single most likely reason the hostname servers fail, so it is
+    // worth stating rather than leaving to inference.
+    const IPAddress dns = WiFi.dnsIP();
+    Serial.printf("[net] DNS for NTP lookups: %s%s\n",
+                  dns.toString().c_str(),
+                  (dns[0] == 0 && dns[1] == 0) ? "  (NONE SET - hostname NTP will fail)" : "");
 }
 
 bool timeReady() {
@@ -362,14 +391,17 @@ bool timeReady() {
         }
     }
 
-    // Report the timeout once, so a network with no NTP egress is diagnosable
-    // instead of looking like the clock silently never worked.
-    static bool reportedTimeout = false;
-    if (!reportedTimeout && (millis() - s_timeSyncStart) > NTP_SYNC_TIMEOUT_MS) {
-        reportedTimeout = true;
-        Serial.printf("[net] NTP: no sync after %d ms (no route to a time server?)\n",
-                      NTP_SYNC_TIMEOUT_MS);
-        Serial.println("[net]   the clock shows 'unsynced' until one arrives");
+    // Progress report once a second while unsynced. Without this, a clock that
+    // never syncs is indistinguishable from one whose sync call was never made —
+    // exactly the ambiguity that made this take longer to find than it should.
+    static uint32_t lastReport = 0;
+    if (millis() - lastReport >= 1000) {
+        lastReport = millis();
+        time_t now = 0;
+        time(&now);
+        const IPAddress dns = WiFi.dnsIP();
+        Serial.printf("[net] NTP waiting: epoch=%ld dns=%s ip=%s rssi=%d\n",
+                      (long)now, dns.toString().c_str(), s_ip, (int)WiFi.RSSI());
     }
     return false;
 }

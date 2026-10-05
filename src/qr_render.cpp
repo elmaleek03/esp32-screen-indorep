@@ -53,18 +53,42 @@ lv_obj_t *create(lv_obj_t *parent, int x, int y, int size) {
         return nullptr;
     }
     lv_obj_set_pos(obj, x, y);
+
+    // --- Quiet zone --------------------------------------------------------
+    //
+    // A QR code needs a margin of blank space around it or scanners cannot
+    // locate its edges; the spec requires at least 4 modules. lv_qrcode_update()
+    // does centre the modules, but it does so with INTEGER arithmetic:
+    //     scale  = obj_w / qr_size
+    //     margin = (obj_w - qr_size * scale) / 2
+    // so the left-over margin depends entirely on how obj_w divides. At the old
+    // 216 px canvas that happened to leave a visible border; at 208 px the
+    // remainder collapsed to nearly zero and the black modules ran right to the
+    // edge.
+    //
+    // Relying on that remainder is fragile, so the margin is now ENFORCED here:
+    // the canvas is drawn at `size` and the visible object is grown by kQuietPx
+    // on every side with a white background. The black area is therefore always
+    // inset by at least kQuietPx regardless of how the division falls.
+    constexpr lv_coord_t kQuietPx = 10;
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_set_style_pad_left(obj, kQuietPx, 0);
+    lv_obj_set_style_pad_top(obj, kQuietPx, 0);
+    lv_obj_set_style_pad_right(obj, kQuietPx, 0);
+    lv_obj_set_style_pad_bottom(obj, kQuietPx, 0);
+
     // The QR must sit on an opaque white tile: transposing a dark theme's
     // background through the quiet zone is the classic "QR won't scan" mistake.
     lv_obj_set_style_bg_color(obj, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(obj, 0, 0);
     lv_obj_set_style_border_width(obj, 0, 0);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
 
     const size_t canvasBytes = (size_t)(size * size) / 8 + 8;
-    Serial.printf("[qr] canvas created: %dx%d, %u bytes from the LVGL heap\n",
-                  size, size, (unsigned)canvasBytes);
+    Serial.printf("[qr] canvas created: %dx%d canvas, %d px quiet zone, "
+                  "%u bytes from the LVGL heap\n",
+                  size, size, (int)kQuietPx, (unsigned)canvasBytes);
     return obj;
 }
 

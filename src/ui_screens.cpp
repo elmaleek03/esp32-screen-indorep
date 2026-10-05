@@ -64,12 +64,14 @@ constexpr lv_coord_t kBarH = UI_STATUS_BAR_H;
 // to report an encode shortfall against the real size. The canvas is FIXED:
 // lv_qrcode allocates its buffer in the constructor and cannot be resized.
 //
-// 208 px (not 216) so the canvas ends at y=264 with an 8 px margin below it. At
-// 216 the bottom edge landed exactly on the panel edge, which leaves no room for
-// error and clips against any future status-bar change.
-constexpr int kQrSize = 208;
-constexpr int kQrX    = kW - kQrSize - 12;
-constexpr int kQrY    = kBarH + 26;
+// The canvas is 196 px and qr::create() adds a 10 px white quiet zone on each
+// side, so the object occupies 216 px on screen and the black modules are never
+// flush with its edge. Ends at y = 44 + 216 = 260, leaving a 12 px margin.
+constexpr int kQrCanvas = 196;
+constexpr int kQrQuiet  = 10;
+constexpr int kQrSize   = kQrCanvas + 2 * kQrQuiet;   // on-screen footprint, 216
+constexpr int kQrX      = kW - kQrSize - 12;
+constexpr int kQrY      = kBarH + 18;
 
 Screen s_current  = Screen::BOOT_SCREEN;
 bool   s_latched  = false;   // route committed; WIFI_SELECT is unreachable
@@ -265,18 +267,23 @@ void statusBar(lv_obj_t *page) {
 
     // Wi-Fi glyph. Montserrat has WIFI but no "wifi-off", so the disconnected
     // state is this glyph plus a slash drawn over it (see the slash below).
+    //
+    // The glyph is 20 px tall, so its box is roughly 0..30 horizontally when
+    // left-aligned at x=8. The SSID starts at x=46, leaving ~16 px of padding
+    // between the glyph and the text so they do not read as one blob.
     lv_obj_t *icon = lv_label_create(bar);
     lv_label_set_text(icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(icon, lv_color_hex(kMuted), 0);
     lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
-    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 8, 0);
 
     // The slash. A single lv_line segment across the glyph, hidden while the
-    // link is up. Points are absolute within the bar.
+    // link is up. Points are absolute within the bar, so they track the icon's
+    // new position.
     static lv_point_t slashPts[2];
-    slashPts[0].x = 12;
+    slashPts[0].x = 10;
     slashPts[0].y = kBarH - 6;
-    slashPts[1].x = 28;
+    slashPts[1].x = 26;
     slashPts[1].y = 4;
     lv_obj_t *slash = lv_line_create(bar);
     lv_line_set_points(slash, slashPts, 2);
@@ -289,7 +296,7 @@ void statusBar(lv_obj_t *page) {
     lv_label_set_text(ssid, "no wifi");
     lv_obj_set_style_text_color(ssid, lv_color_hex(UI_STATUS_BAR_FG), 0);
     lv_obj_set_style_text_font(ssid, &lv_font_montserrat_14, 0);
-    lv_obj_align(ssid, LV_ALIGN_LEFT_MID, 34, 0);
+    lv_obj_align(ssid, LV_ALIGN_LEFT_MID, 46, 0);
 
     // Register this page's copy so setWifiBar() updates ALL of them, not just
     // the last one built. See the StatusBarRefs comment for why this matters.
@@ -627,7 +634,9 @@ void build() {
     s_qrTitle = label(s_qris, "QRIS", 24, kBarH + 10, kText,
                       &lv_font_montserrat_16);
 
-    s_qrObj = qr::create(s_qris, kQrX, kQrY, kQrSize);
+    // The CANVAS size is passed, not the on-screen footprint: qr::create() adds
+    // the quiet-zone padding itself. Passing kQrSize here would double it.
+    s_qrObj = qr::create(s_qris, kQrX + kQrQuiet, kQrY + kQrQuiet, kQrCanvas);
 
     s_qrItems = lv_label_create(s_qris);
     lv_label_set_text(s_qrItems, "");
@@ -643,7 +652,7 @@ void build() {
     lv_label_set_text(s_qrTotal, "");
     lv_obj_set_style_text_color(s_qrTotal, lv_color_hex(kGood), 0);
     lv_obj_set_style_text_font(s_qrTotal, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(s_qrTotal, 20, kQrY + kQrSize - 24);
+    lv_obj_set_pos(s_qrTotal, 20, kQrY + kQrSize - 22);
 
     showBootScreen();
 }
@@ -773,7 +782,7 @@ void showQris(const PaymentPayload &payload) {
             if (s_qrTitle) lv_label_set_text(s_qrTitle, "SCAN UNTUK BAYAR");
         } else {
             Serial.printf("[ui] QR encode failed (wanted %dpx in a %dpx canvas)\n",
-                          wantPx, kQrSize);
+                          wantPx, kQrCanvas);
             qr::setVisible(s_qrObj, false);
             if (s_qrTitle) lv_label_set_text(s_qrTitle, "QR GAGAL DIBUAT");
         }

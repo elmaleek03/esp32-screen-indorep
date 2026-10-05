@@ -254,12 +254,28 @@
 // homescreen shows the clock face with a visible "unsynced" cue rather than a
 // plausible-looking wrong time.
 //
+// DNS server handed to the stack alongside the static address.
+//
+// THIS IS REQUIRED FOR NTP. An earlier revision set no DNS server with the
+// comment "the device is a server, not a client" — true until the standby clock
+// was added. The SNTP client resolves NTP_SERVER_* by hostname, so with no DNS
+// server configured the lookup fails and the clock never syncs, silently.
+//
+// The gateway is the right default: routers on these networks run a DNS
+// resolver. Override with a specific server if your network needs one.
+#define NET_DNS_SERVER    NET_FALLBACK_GW
+
 // TZ offset is in SECONDS, and there is no DST term because Indonesia has none.
 // WIB (Jakarta) is UTC+7 -> 7 * 3600 = 25200.
 #define NTP_TZ_OFFSET_S   25200
 #define NTP_TZ_DST_S      0
+
+// NTP servers. configTime() accepts at most three. The first two are hostnames
+// (the normal path); the third is a raw IP of a well-known public time server,
+// so the clock can still sync on a network where hostname resolution is broken.
 #define NTP_SERVER_1      "pool.ntp.org"
 #define NTP_SERVER_2      "time.google.com"
+#define NTP_SERVER_3      "216.239.35.0"      // time.google.com (anycast IP)
 
 // Give up waiting for a sync after this long and just report "unsynced". The
 // clock keeps retrying in the background; this only governs the UI label.
