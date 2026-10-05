@@ -66,4 +66,27 @@ const char *statusLine();
 // reservation / static-lease table.
 const char *macString();
 
+// --- Wall-clock time (NTP) --------------------------------------------------
+//
+// The standby clock is the only consumer. Time is synced over NTP once the
+// station is associated; until then timeReady() stays false and the UI must show
+// an explicit "not synced" state rather than a plausible-looking wrong time.
+
+// Start the NTP client. Safe to call more than once; only the first call does
+// anything. Call this right after a successful association.
+void beginTimeSync();
+
+// True once the system clock has been set from NTP and is plausible.
+bool timeReady();
+
+// Current local time, honouring NTP_TZ_OFFSET_S. Only meaningful when
+// timeReady() is true, but it always fills the struct with whatever the system
+// clock believes, so callers can render a face either way.
+struct TimeOfDay {
+    uint8_t hour;    // 0..23
+    uint8_t minute;  // 0..59
+    uint8_t second;  // 0..59
+};
+TimeOfDay localTime();
+
 }  // namespace net

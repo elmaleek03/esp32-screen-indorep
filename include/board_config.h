@@ -247,6 +247,41 @@
 #define WEB_SERVER_PORT      80
 
 // ---------------------------------------------------------------------------
+// Time (NTP) — used only by the analog clock on the standby screen
+// ---------------------------------------------------------------------------
+// The clock is the one thing in the UI that needs wall-clock time, so the device
+// syncs over NTP once it has associated. Until the first sync succeeds the
+// homescreen shows the clock face with a visible "unsynced" cue rather than a
+// plausible-looking wrong time.
+//
+// TZ offset is in SECONDS, and there is no DST term because Indonesia has none.
+// WIB (Jakarta) is UTC+7 -> 7 * 3600 = 25200.
+#define NTP_TZ_OFFSET_S   25200
+#define NTP_TZ_DST_S      0
+#define NTP_SERVER_1      "pool.ntp.org"
+#define NTP_SERVER_2      "time.google.com"
+
+// Give up waiting for a sync after this long and just report "unsynced". The
+// clock keeps retrying in the background; this only governs the UI label.
+#define NTP_SYNC_TIMEOUT_MS  15000
+
+// ---------------------------------------------------------------------------
+// Layout constants for the new production UI
+// ---------------------------------------------------------------------------
+// Everything is designed against 480x272 with no scrolling.
+
+// Shared top status bar (wifi icon + slash + SSID), drawn on every screen except
+// the boot log. Replaces the old 30 px decorative header.
+#define UI_STATUS_BAR_H      26
+#define UI_STATUS_BAR_BG     0x1B1B28
+#define UI_STATUS_BAR_FG     0xE8E8F0
+
+// Analog clock on the standby screen.
+#define UI_CLOCK_DIAMETER    150
+#define UI_CLOCK_X           24
+#define UI_CLOCK_Y           58
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 // 1 = print the periodic heartbeat, touch polls, I2C scans and panel stats.

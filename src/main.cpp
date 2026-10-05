@@ -91,6 +91,7 @@ void printHelp() {
     Serial.println("  q      show a local test QRIS page (no network needed)");
     Serial.println("  i      full system report");
     Serial.println("  m      print the station MAC (for a router static lease)");
+    Serial.println("  u      back to the WiFi chooser (only before the route is latched)");
     Serial.println("-------------------------------------------------------------");
 }
 
@@ -126,7 +127,9 @@ void printSystemReport() {
     Serial.printf(" web server  : %s, %lu request(s)\n",
                   web::running() ? "RUNNING :80" : "stopped",
                   (unsigned long)web::requestCount());
-    Serial.printf(" screen      : %d\n", (int)ui::current());
+    Serial.printf(" screen      : %d  routeLatched=%d  ntp=%s\n",
+                  (int)ui::current(), ui::routeLatched() ? 1 : 0,
+                  net::timeReady() ? "synced" : "not synced");
     Serial.println("=============================================================");
 }
 
@@ -207,7 +210,6 @@ void serviceSerialConsole() {
         case 'r': case 'R':
             Serial.println("[diag] reset -> standby");
             ui::showHome();
-            ui::setHomeStatus("menunggu transaksi...");
             break;
         case 'q': case 'Q': {
             Serial.println("[diag] local test QRIS page");
@@ -232,6 +234,17 @@ void serviceSerialConsole() {
         }
         case 'i': case 'I':
             printSystemReport();
+            break;
+        case 'u': case 'U':
+            // Return to the Wi-Fi chooser. ONLY works before the route is
+            // latched — after Continue the latch is permanent by design, so this
+            // prints why it refused rather than silently doing nothing.
+            if (ui::routeLatched()) {
+                Serial.println("[diag] cannot go back: route is LATCHED (reboot to change AP)");
+            } else {
+                Serial.println("[diag] -> wifi select");
+                ui::showWifiSelect();
+            }
             break;
         case 'm': case 'M':
             // Print just the MAC, on its own line, so it can be copied straight
@@ -263,11 +276,13 @@ void logHeartbeat() {
     const uint32_t d_part = ds.partial_flushes - prev.partial_flushes;
     prev = ds;
 
-    Serial.printf("[hb] t=%lus screen=%d wifi=%s web=%s "
+    Serial.printf("[hb] t=%lus screen=%d latched=%d wifi=%s web=%s ntp=%s "
                   "flush+%lu(full %lu part %lu) "
                   "touch=%lu/%lu(rel %lu forced %lu) heap=%uK psram=%uK\n",
-                  (unsigned long)up, (int)ui::current(), net::statusLine(),
+                  (unsigned long)up, (int)ui::current(),
+                  ui::routeLatched() ? 1 : 0, net::statusLine(),
                   web::running() ? "up" : "down",
+                  net::timeReady() ? "ok" : "no",
                   (unsigned long)(d_full + d_part), (unsigned long)d_full,
                   (unsigned long)d_part,
                   (unsigned long)ts.samples, (unsigned long)ts.polls,
@@ -308,13 +323,15 @@ void runPendingActions() {
             s_action = Action::NONE;
             // Abort an in-flight association if there is one (the "Batal" button
             // on the connecting screen). If we are already connected, leave the
-            // link alone: somebody backing out of the menu should not knock the
-            // device off the network it is serving the backend on.
+            // link alone: backing out of the chooser should not knock the device
+            // off the network it is serving the backend on.
             if (net::connecting()) {
                 Serial.println("[app] cancel: aborting association");
                 net::disconnect();
             }
-            ui::showBootMenu();
+            // showWifiSelect() refuses if the route is latched, so this cannot
+            // be used to escape the committed route.
+            ui::showWifiSelect();
             break;
         case Action::NONE:
         default:
@@ -324,24 +341,27 @@ void runPendingActions() {
 
 // --- wifi / server lifecycle ----------------------------------------------
 bool s_serverStarted = false;
+// NTP is started once, after the first successful association.
+bool s_ntpStarted = false;
 
 void serviceNetwork() {
     if (!net::connecting()) return;
 
     if (net::poll()) {
-        // Connected: bring the web server up and move to CONFIRM.
+        // Connected: bring the web server up and move to SUMMARY.
         const bool ok = web::begin();
         s_serverStarted = ok;
-        ui::showConfirm(net::activeSsid(), net::ipString(), ok);
+        s_ntpStarted = false;   // allow the sync to start for this new link
+        ui::showSummary(net::activeSsid(), ok);
         Serial.printf("[boot] web server %s\n", ok ? "RUNNING" : "FAILED");
         return;
     }
 
     if (net::failed()) {
-        // showConnectFailed() records the reason and switches back to the menu,
-        // so the operator sees WHY rather than watching the menu silently
+        // showConnectFailed() records the reason and returns to the chooser, so
+        // the operator sees WHY rather than watching the chooser silently
         // reappear (which looks like the tap was never registered).
-        Serial.println("[boot] connect failed, returning to menu");
+        Serial.println("[boot] connect failed, returning to wifi select");
         ui::showConnectFailed(net::activeSsid(), net::failureReason());
         return;
     }
@@ -351,9 +371,7 @@ void serviceNetwork() {
     // This used to run on every loop pass (~500 Hz). Every call reached
     // lv_label_set_text(), which marks the label dirty and makes LVGL redraw it
     // on the next timer run — a permanent redraw storm. That storm is what made
-    // the connecting screen ignore touch (the UI never settled between frames,
-    // so a press/release pair could be swallowed) and kept the panel visibly
-    // busy. Rate-limiting it is not an optimisation; it is the fix.
+    // the connecting screen ignore touch and kept the panel visibly busy.
     static uint32_t lastStatusMs = 0;
     if (millis() - lastStatusMs < 500) return;
     lastStatusMs = millis();
@@ -361,8 +379,58 @@ void serviceNetwork() {
     ui::setConnectingStatus(net::statusLine());
 }
 
+// Start the NTP sync once, after the first successful association. Kept separate
+// from serviceNetwork() because it is not part of the connect state machine: it
+// only needs to happen once the link is up, and failing to sync must never
+// affect anything but the clock.
+void serviceTimeSync() {
+    if (s_ntpStarted) return;
+
+    // Log the gate once (after a few seconds, so boot noise is past) so a silent
+    // failure here is visible in the log rather than looking like "the clock
+    // just never works".
+    static bool loggedWait = false;
+    if (!net::connected()) {
+        static uint32_t firstMs = 0;
+        if (firstMs == 0) firstMs = millis();
+        if (!loggedWait && (millis() - firstMs) > 5000) {
+            loggedWait = true;
+            Serial.printf("[net] NTP not started after 5 s: connected()=%d "
+                          "(WiFi.status=%d, ip=%s)\n",
+                          net::connected() ? 1 : 0, (int)WiFi.status(),
+                          net::ipString());
+        }
+        return;
+    }
+
+    s_ntpStarted = true;
+    Serial.printf("[net] link up (ssid=%s) -> starting NTP\n", net::activeSsid());
+    net::beginTimeSync();
+}
+
 // --- web payload consumption (main-loop task only) -------------------------
+//
+// PAYLOAD POLICY: a backend push is only allowed to affect the UI once the
+// operator has completed setup and the route is latched.
+//
+// Before that there is no network connection at all, so nothing can arrive — but
+// the guard is still here because it makes the invariant explicit and cheap:
+// without it, a stray request during the boot animation or the Wi-Fi chooser
+// would yank the operator out of setup and into a standby screen.
 void serviceWebPayload() {
+    if (!ui::routeLatched()) {
+        // Drain without acting, so a request that arrives early is discarded
+        // rather than queued up and fired the moment setup completes.
+        PaymentPayload dropped = {};
+        if (web::takePending(&dropped)) {
+            Serial.println("[app] payload ignored: setup not complete");
+        }
+        if (web::takeResetRequest()) {
+            Serial.println("[app] /reset ignored: setup not complete");
+        }
+        return;
+    }
+
     PaymentPayload p = {};
     if (web::takePending(&p)) {
         Serial.printf("[app] rendering payload: qr=%s cart=%d total=\"%s\"\n",
@@ -371,36 +439,31 @@ void serviceWebPayload() {
     }
 
     if (web::takeResetRequest()) {
-        // Unconditional: /reset means "go back to standby" and must work from
-        // ANY state. The Go backend calls it at the end of a payment without
-        // knowing what the device is displaying, so refusing it when the device
-        // happens to already be on standby would leave stale items on screen
-        // after the next /update. Idempotent by design.
+        // Unconditional once setup is done: /reset means "go back to standby" and
+        // must work from ANY screen. The Go backend calls it at the end of a
+        // payment without knowing what the device is displaying, so refusing it
+        // when the device happens to already be on standby would leave stale
+        // items on screen after the next /update. Idempotent by design.
         Serial.printf("[app] /reset -> standby (was screen %d)\n",
                       (int)ui::current());
         ui::showHome();
-        ui::setHomeStatus("menunggu transaksi...");
     }
 }
 
-// --- homescreen status -----------------------------------------------------
-void serviceHomeStatus() {
-    if (ui::current() != Screen::HOME) return;
-
+// --- shared status bar -----------------------------------------------------
+//
+// Drives the wifi icon / slash / SSID on every screen except the boot log.
+//
+// Rate-limited to 4 Hz AND change-detected inside ui::setWifiBar(), because the
+// underlying accessors (WiFi.status(), WiFi.SSID()) take the ESP-IDF Wi-Fi driver
+// mutex — calling them per loop pass is what previously stalled the UI during
+// association.
+void serviceWifiBar() {
     static uint32_t last = 0;
-    if (millis() - last < 3000) return;
+    if (millis() - last < 250) return;
     last = millis();
 
-    // Plain device status. Deliberately says nothing about the backend: the
-    // firmware cannot know where the backend points or whether traffic reaches
-    // it, so claiming "UNREACHABLE" here would be a guess presented as a fault.
-    // What it CAN state is its own address, which is what an operator needs to
-    // check routing against.
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s  |  ip %s  rssi %d dBm  |  :80 %s",
-             net::activeSsid(), net::ipString(), net::rssi(),
-             web::running() ? "READY" : "DOWN");
-    ui::setHomeStatus(buf);
+    ui::setWifiBar(net::connected(), net::connected() ? net::activeSsid() : nullptr);
 }
 
 }  // namespace
@@ -471,11 +534,16 @@ void setup() {
     Serial.printf("[boot] touch init: %s\n", touchOk ? "OK" : "UNAVAILABLE");
 
     // --- 4. UI -------------------------------------------------------------
+    // build() constructs every page AND shows the boot log. That ordering is
+    // deliberate and is what keeps the boot screen honest: all real
+    // initialisation has already happened by the time it is visible, so a genuine
+    // init failure is reported (or halts) before the cosmetic log ever appears.
+    // The log is a reveal animation driven from ui::tick(), nothing more.
     ui::build();
-    Serial.println("[boot] UI built (boot menu)");
+    Serial.println("[boot] UI built (boot screen)");
 
     // The self-test left its pattern on the glass. Force LVGL to redraw the
-    // whole screen so the boot menu replaces it rather than being composited on
+    // whole screen so the boot log replaces it rather than being composited on
     // top of stale test pixels. A few ticks are needed because the flush is
     // completed in task context by display::tick() itself.
     lv_obj_invalidate(lv_scr_act());
@@ -545,6 +613,10 @@ void loop() {
     //    internally to 10 Hz so it cannot hold the loop open.
     serviceNetwork();
 
+    // 3b. Start NTP once the link is up. Does nothing until then, and nothing
+    //     waits on it: the clock shows "unsynced" until a reply arrives.
+    serviceTimeSync();
+
     // 4. HTTP: serve a request, publish any payload. Never touches LVGL.
     web::pump();
 
@@ -554,7 +626,7 @@ void loop() {
 
     // 6. Time-based UI refresh + always-on diagnostics.
     ui::tick();
-    serviceHomeStatus();
+    serviceWifiBar();
     logTouchTrace();
     logHeartbeat();
 

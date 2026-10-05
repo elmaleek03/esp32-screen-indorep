@@ -319,6 +319,72 @@ const char *statusLine() {
     return s_line;
 }
 
+// --- Time (NTP) -------------------------------------------------------------
+//
+// The standby clock is the only consumer. None of this runs on a hot path:
+// configTime() hands the work to the ESP-IDF SNTP client and returns, and
+// localTime() just reads the system clock.
+//
+// The device has NO RTC and no battery, so time is lost on every power cycle.
+// That is why the UI needs an explicit "unsynced" state rather than assuming a
+// clock is available.
+static bool     s_timeSyncStarted = false;
+static bool     s_timeReady       = false;
+static uint32_t s_timeSyncStart   = 0;
+
+void beginTimeSync() {
+    if (s_timeSyncStarted) return;
+    s_timeSyncStarted = true;
+    s_timeSyncStart = millis();
+
+    // TZ offset is passed in seconds, matching NTP_TZ_OFFSET_S (WIB, UTC+7).
+    // Passing it here means getLocalTime() reports local time, so there is
+    // exactly one definition of "local" in the firmware.
+    configTime(NTP_TZ_OFFSET_S, NTP_TZ_DST_S, NTP_SERVER_1, NTP_SERVER_2);
+    Serial.printf("[net] NTP sync started (%s, %s), TZ offset %+ld s\n",
+                  NTP_SERVER_1, NTP_SERVER_2, (long)NTP_TZ_OFFSET_S);
+}
+
+bool timeReady() {
+    if (s_timeReady) return true;
+    if (!s_timeSyncStarted) return false;
+
+    struct tm t = {};
+    if (getLocalTime(&t, 0)) {
+        // Sanity-check the year. An unset clock reads 1970, and a bad reply can
+        // land anywhere; anything outside this window must not be shown as time.
+        if (t.tm_year >= (2024 - 1900) && t.tm_year <= (2099 - 1900)) {
+            s_timeReady = true;
+            Serial.printf("[net] NTP synced: %04d-%02d-%02d %02d:%02d:%02d local\n",
+                          t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                          t.tm_hour, t.tm_min, t.tm_sec);
+            return true;
+        }
+    }
+
+    // Report the timeout once, so a network with no NTP egress is diagnosable
+    // instead of looking like the clock silently never worked.
+    static bool reportedTimeout = false;
+    if (!reportedTimeout && (millis() - s_timeSyncStart) > NTP_SYNC_TIMEOUT_MS) {
+        reportedTimeout = true;
+        Serial.printf("[net] NTP: no sync after %d ms (no route to a time server?)\n",
+                      NTP_SYNC_TIMEOUT_MS);
+        Serial.println("[net]   the clock shows 'unsynced' until one arrives");
+    }
+    return false;
+}
+
+TimeOfDay localTime() {
+    TimeOfDay out = {0, 0, 0};
+    struct tm t = {};
+    if (getLocalTime(&t, 0)) {
+        out.hour   = (uint8_t)t.tm_hour;
+        out.minute = (uint8_t)t.tm_min;
+        out.second = (uint8_t)t.tm_sec;
+    }
+    return out;
+}
+
 const char *macString() {
     // Cached because the station MAC comes from eFuse and cannot change, and
     // because WiFi.macAddress() allocates a String on every call.

@@ -83,9 +83,9 @@
    FONTS
    Only the sizes the UI uses. LV_FONT_MONTSERRAT_14 is the default face.
  *====================*/
-#define LV_FONT_MONTSERRAT_12 0
+#define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 0
+#define LV_FONT_MONTSERRAT_16 1
 #define LV_FONT_MONTSERRAT_18 0
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_22 0
@@ -151,7 +151,16 @@
 #define LV_USE_DROPDOWN   0
 #define LV_USE_IMG        1   /* QR shown as an image */
 #define LV_USE_LABEL      1
-#define LV_USE_LINE       0
+/* Line: a straight segment between two points.
+ *
+ * Needed for two things, both of which are otherwise impossible with the fonts
+ * available:
+ *   1. the diagonal slash that turns LV_SYMBOL_WIFI into the "disconnected"
+ *      icon. Montserrat has no wifi-off glyph.
+ *   2. the analog clock hands on the homescreen.
+ *
+ * Costs one small .c file. */
+#define LV_USE_LINE       1
 #define LV_USE_ROLLER     0
 #define LV_USE_SLIDER     0
 #define LV_USE_SWITCH     0

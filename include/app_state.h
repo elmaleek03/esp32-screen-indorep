@@ -12,12 +12,17 @@ enum class NetChoice : uint8_t {
 };
 
 // Top-level UI state machine.
+//
+// The flow is one-way after SUMMARY: once the operator presses Continue, the
+// device is committed to that network for the life of the boot and WIFI_SELECT
+// becomes unreachable. See ui::show() for the latch that enforces it.
 enum class Screen : uint8_t {
-    BOOT_MENU = 0,   // pick WARNET / CAFE / debug
-    CONNECTING,      // associating + DHCP + starting web server
-    CONFIRM,         // show SSID / IP / web-server status + Finish + Back
-    HOME,            // standby homescreen (static "ready" text)
-    QRIS,            // QR + cart summary + total
+    BOOT_SCREEN = 0,  // cosmetic terminal log, auto-advances
+    WIFI_SELECT,      // choose WARNET / CAFE (small Debug bottom-right)
+    CONNECTING,       // associating + DHCP + starting web server
+    SUMMARY,          // big green check + wifi info + Continue (commits the route)
+    HOME,             // standby: analog clock + branch name
+    QRIS,             // QR + cart summary + total
 };
 
 // Result of a web-server start attempt, shown on the CONFIRM screen.
