@@ -346,8 +346,6 @@ void runPendingActions() {
 
 // --- wifi / server lifecycle ----------------------------------------------
 bool s_serverStarted = false;
-// NTP is started once, after the first successful association.
-bool s_ntpStarted = false;
 
 void serviceNetwork() {
     if (!net::connecting()) return;
@@ -356,7 +354,6 @@ void serviceNetwork() {
         // Connected: bring the web server up and move to SUMMARY.
         const bool ok = web::begin();
         s_serverStarted = ok;
-        s_ntpStarted = false;   // allow the sync to start for this new link
         ui::showSummary(net::activeSsid(), net::ipString(), ok);
         Serial.printf("[boot] web server %s\n", ok ? "RUNNING" : "FAILED");
         return;
@@ -384,18 +381,24 @@ void serviceNetwork() {
     ui::setConnectingStatus(net::statusLine());
 }
 
-// Start the NTP sync once, after the first successful association. Kept separate
-// from serviceNetwork() because it is not part of the connect state machine: it
-// only needs to happen once the link is up, and failing to sync must never
-// affect anything but the clock.
+// NTP is armed once the link is up, then DRIVEN every pass. Kept separate from
+// serviceNetwork() because it is not part of the connect state machine: failing
+// to sync must never affect anything but the clock.
+//
+// Why it is driven and not just armed: configTime() called once, before DNS or
+// the socket is ready, fails and is never re-issued — the clock then sits on
+// "belum sinkron" for the whole boot. net::serviceTimeSync() is re-entrant and
+// retries until a plausible time arrives, so it must be called on every pass.
 void serviceTimeSync() {
-    if (s_ntpStarted) return;
-
-    // Log the gate once (after a few seconds, so boot noise is past) so a silent
-    // failure here is visible in the log rather than looking like "the clock
-    // just never works".
-    static bool loggedWait = false;
+    // Arm whenever the link is up. beginTimeSync() is idempotent and net.cpp
+    // drops its own arm if the link goes down, so this no longer needs a
+    // separate latch here — a duplicate latch is exactly what made a reconnect
+    // unable to restart the sync.
     if (!net::connected()) {
+        // Log the gate once (after a few seconds, so boot noise is past) so a
+        // silent failure here is visible rather than looking like "the clock
+        // just never works".
+        static bool loggedWait = false;
         static uint32_t firstMs = 0;
         if (firstMs == 0) firstMs = millis();
         if (!loggedWait && (millis() - firstMs) > 5000) {
@@ -408,9 +411,8 @@ void serviceTimeSync() {
         return;
     }
 
-    s_ntpStarted = true;
-    Serial.printf("[net] link up (ssid=%s) -> starting NTP\n", net::activeSsid());
-    net::beginTimeSync();
+    net::beginTimeSync();       // idempotent; arms on the first connected pass
+    net::serviceTimeSync();     // drives it; non-blocking, no-op once synced
 }
 
 // --- web payload consumption (main-loop task only) -------------------------

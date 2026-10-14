@@ -71,10 +71,27 @@ const char *macString();
 // The standby clock is the only consumer. Time is synced over NTP once the
 // station is associated; until then timeReady() stays false and the UI must show
 // an explicit "not synced" state rather than a plausible-looking wrong time.
+//
+// WHY THERE IS A service* FUNCTION AND NOT JUST begin*()
+//
+// configTime() is not fire-and-forget on this core. It configures the SNTP
+// client, but if DNS or the socket is not usable YET when it is called, that
+// first attempt fails and nothing re-issues it: the clock then sits at
+// "unsynced" for the rest of the boot. That is the observed "sometimes it shows
+// the time, sometimes it is stuck on belum sinkron".
+//
+// So the timing is driven from the main loop: beginTimeSync() arms the intent,
+// and serviceTimeSync() (called every pass) waits for DNS to be ready, then
+// (re)issues configTime() until a plausible time actually arrives. Nothing here
+// blocks.
 
-// Start the NTP client. Safe to call more than once; only the first call does
-// anything. Call this right after a successful association.
+// Arm the NTP sync. Idempotent. Call once the link is up. Does not itself start
+// the sync: serviceTimeSync() does that, so the first attempt can wait for DNS.
 void beginTimeSync();
+
+// Drive the sync. Call every pass of the main loop. Non-blocking. Returns
+// immediately once the clock is synced.
+void serviceTimeSync();
 
 // True once the system clock has been set from NTP and is plausible.
 bool timeReady();

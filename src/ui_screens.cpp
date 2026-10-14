@@ -529,16 +529,29 @@ void updateClock() {
     const net::TimeOfDay t = net::localTime();
     const bool ready = net::timeReady();
 
-    // Only redraw when something the face actually depends on has changed.
-    // Without this the clock would invalidate its region on every loop pass,
-    // which is exactly the redraw storm that previously starved input.
+    // Redraw only when something the face depends on changed. Note the digital
+    // readout shows SECONDS, so a change of second is a real change; hour/minute
+    // are checked too so a time jump (a late sync) is never missed.
+    //
+    // `lastReady` is the important one: the transition false -> true is what
+    // clears the "belum sinkron" cue, and it must not be missed even if the
+    // hour/minute/second happen to be unchanged.
     static uint8_t lastS = 0xFF, lastM = 0xFF, lastH = 0xFF;
     static int lastReady = -1;
     const int readyNow = ready ? 1 : 0;
-    if (readyNow == lastReady && t.second == lastS && t.minute == lastM &&
-        t.hour == lastH) {
-        return;
+
+    const bool changed = (readyNow != lastReady) || (t.second != lastS) ||
+                         (t.minute != lastM) || (t.hour != lastH);
+    if (!changed) return;
+
+    // Log the sync transition once. This is the point the "belum sinkron" cue is
+    // cleared, so if the screen and this log ever disagree, the log dates it.
+    if (readyNow != lastReady) {
+        Serial.printf("[ui] clock %s (state %d -> %d)\n",
+                      ready ? "SYNCED, clearing cue" : "unsynced",
+                      lastReady, readyNow);
     }
+
     lastS = t.second;
     lastM = t.minute;
     lastH = t.hour;
@@ -564,6 +577,9 @@ void updateClock() {
     // silently reads 12:00 forever would look like a frozen screen, so when the
     // clock has not synced we say so plainly and show --:-- instead of a
     // plausible-looking wrong time.
+    //
+    // The sync cue is set from `ready` on EVERY redraw (not only on the
+    // transition), so it can never be left visible by a missed edge.
     char buf[32];
     if (ready) {
         snprintf(buf, sizeof(buf), "%02u:%02u:%02u", t.hour, t.minute, t.second);
@@ -737,10 +753,18 @@ void build() {
     }
 
     // Digital readout under the face, plus the unsynced cue.
-    s_homeClock = label(s_home, "--:--:--", UI_CLOCK_X, UI_CLOCK_Y + UI_CLOCK_DIAMETER + 6,
-                        kMuted, &lv_font_montserrat_20);
+    //
+    // LEFT-ALIGNED with the clock face (as before), not centred: centring pushed
+    // the text right to under the "Indorep" branch label, which read as two
+    // competing blocks. A small left inset (kClockTextPadX) nudges it off the
+    // face's exact left edge so it does not look glued to it.
+    constexpr lv_coord_t kClockTextPadX = 12;
 
-    s_homeSync = label(s_home, "belum sinkron", UI_CLOCK_X,
+    s_homeClock = label(s_home, "--:--:--", UI_CLOCK_X + kClockTextPadX,
+                        UI_CLOCK_Y + UI_CLOCK_DIAMETER + 6, kMuted,
+                        &lv_font_montserrat_20);
+
+    s_homeSync = label(s_home, "belum sinkron", UI_CLOCK_X + kClockTextPadX,
                        UI_CLOCK_Y + UI_CLOCK_DIAMETER + 32, kWarn,
                        &lv_font_montserrat_12);
     // Start hidden, shown by updateClock() when there is no time.

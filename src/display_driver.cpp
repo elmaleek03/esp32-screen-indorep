@@ -71,30 +71,28 @@ esp_lcd_panel_handle_t s_panel = nullptr;
 lv_disp_draw_buf_t s_draw_buf;
 lv_color_t        *s_buf1 = nullptr;
 
-// The driver LVGL actually registered. lv_disp_drv_register() COPIES the struct
-// it is given, so a file-scope lv_disp_drv_t is only the template, not the live
-// object. tick() must release the flush through this pointer.
+// The driver LVGL actually registered. Kept for the health log; flushCb()
+// receives its own drv pointer, so the release no longer needs to round-trip
+// through this.
 lv_disp_drv_t     *s_registered_drv = nullptr;
 
 // Set from the panel's completion ISR, and cleared in flushCb() BEFORE the
-// transfer starts. tick() waits on this before releasing LVGL. It is the ONLY
+// transfer starts. flushCb() waits on this before releasing LVGL. It is the ONLY
 // signal that the DMA has finished reading the draw buffer.
 //
 // Starting true means the first flush after boot is not made to wait for a
 // callback that will never come.
 volatile bool s_flush_done = true;
 
-// Number of flushes LVGL has handed us since the last tick(). Recorded for the
-// health log; it deliberately does NOT gate rendering.
+// Number of flushes seen since the last health log, for the diagnostic line.
 uint32_t s_flush_outstanding = 0;
 
-bool     s_flush_pending    = false;
 uint32_t s_flush_started_us = 0;
 Stats    s_stats = {};
 
-// Flushes that hit the timeout in tick() without a completion interrupt. Should
-// stay at 0 in normal operation; a non-zero value means the panel's completion
-// callback is being missed and the UI is running one frame behind.
+// Flushes that hit the bounded wait in flushCb() without a completion interrupt.
+// Should stay at 0 in normal operation; a non-zero value means the panel's
+// completion callback is being missed and each frame is costing the full timeout.
 uint32_t s_flush_timeouts = 0;
 
 // Why the glitch is diagnosable: record how MUCH is being flushed each time.
@@ -149,8 +147,6 @@ bool onFlushComplete(esp_lcd_panel_handle_t panel,
 }
 
 void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
-    (void)drv;
-
     if (s_panel == nullptr) {
         // Nothing to draw into: release immediately or LVGL stalls forever.
         lv_disp_flush_ready(drv);
@@ -160,12 +156,12 @@ void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
     // ARM BEFORE STARTING. The completion callback can fire from the ISR as soon
     // as the transfer begins (especially for a small partial update that the
     // bounce-buffer DMA drains in microseconds). If we cleared the flag after
-    // calling draw_bitmap(), that completion would be swallowed and tick() would
-    // sit out the full timeout on every frame.
+    // calling draw_bitmap(), that completion would be swallowed and we would sit
+    // out the full timeout on every frame.
     s_flush_done = false;
-    s_flush_pending = true;
     s_flush_started_us = micros();
     s_stats.flushes++;
+    s_flush_outstanding++;
 
     // Record the flushed area, so the heartbeat's flush counters can be read as
     // "full frames" vs "partial updates" rather than as a meaningless total.
@@ -178,24 +174,45 @@ void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
         s_flush_part_cnt++;
     }
 
-    s_flush_outstanding++;
-
     // Inclusive 1-based end coordinates, as esp_lcd expects.
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px);
 
-    // DO NOT call lv_disp_flush_ready() here.
+    // WAIT (bounded) FOR THE DMA TO FINISH READING `px`, THEN RELEASE LVGL —
+    // exactly once, for THIS call.
     //
     // `px` points into the ONE draw buffer (s_buf1). draw_bitmap() with bounce
-    // buffers only COPIES `px` into the bounce buffer and returns; the actual
-    // move into the frame buffer happens on DMA afterwards, reading `px` the
-    // whole time. Releasing LVGL now would let it render the very next frame into
-    // s_buf1 while that copy is still in flight — the panel then receives a mix
-    // of the old and new frames. Observed as the status bar being torn or
-    // duplicated lower down the panel.
+    // buffers only COPIES `px` into the bounce buffer and returns; the copy runs
+    // on DMA afterwards, reading `px` the whole time. Releasing LVGL before that
+    // finishes lets LVGL render the next frame into s_buf1 mid-copy, and the
+    // panel shows a blend of two frames (seen as the status bar tearing and
+    // reappearing at the bottom).
     //
-    // tick() waits for s_flush_done (bounded) and releases LVGL there, in task
-    // context, once the DMA has finished with the buffer.
+    // The release MUST be here, keyed 1:1 to this flushCb call. An earlier
+    // revision moved it into tick() and released once per tick instead — but LVGL
+    // can call flushCb several times between two lv_timer_handler() runs, so that
+    // released too few times and left LVGL's outstanding-flush count permanently
+    // non-zero: the UI stopped updating (the digital clock froze) and the wedged
+    // render loop slowed the whole firmware enough that HTTP requests timed out.
+    //
+    // The wait is BOUNDED: a lost completion interrupt costs one late frame, not
+    // a frozen UI. This runs in the LVGL task, and the completion is signalled
+    // from the panel ISR, so the loop is short.
+    constexpr uint32_t kFlushTimeoutUs = 30000;   // 30 ms ~ 1 frame at 33 Hz
+    while (!s_flush_done && (micros() - s_flush_started_us) < kFlushTimeoutUs) {
+        // Yield briefly rather than spinning flat out. The completion is
+        // signalled from the panel ISR, so this loop is normally only a few
+        // dozen microseconds; yielding keeps the Wi-Fi/idle tasks alive even in
+        // the pathological case where the ISR is missed and we sit here for the
+        // full timeout. Without the yield, a missed ISR would monopolise the CPU
+        // and HTTP requests would time out.
+        delayMicroseconds(50);
+    }
+    if (!s_flush_done) {
+        s_flush_timeouts++;
+    }
+
+    lv_disp_flush_ready(drv);
 }
 
 }  // namespace
@@ -502,37 +519,15 @@ bool selfTest() {
 }
 
 void tick() {
-    // Release the previous flush HERE, in task context, only after the DMA has
-    // finished reading the draw buffer. flushCb() deliberately does not release
-    // LVGL (see its comment): doing so let LVGL overwrite the draw buffer while
-    // the bounce-buffer DMA was still copying it, which tore the panel — most
-    // visibly the status bar appearing lower down the screen.
+    // LVGL is released inside flushCb(), once per flush, after the bounded wait
+    // for the panel's DMA to finish with the draw buffer (see flushCb). There is
+    // therefore nothing to drain here: this function's only job is to run LVGL.
     //
-    // The wait is BOUNDED. A lost or late completion interrupt must cost at most
-    // one late frame, never a frozen UI, so a timeout releases LVGL anyway and
-    // counts the event so it is visible in the health log.
-    if (s_flush_pending) {
-        constexpr uint32_t kFlushTimeoutUs = 30000;   // 30 ms ~ 1 frame at 33 Hz
-
-        while (!s_flush_done && (micros() - s_flush_started_us) < kFlushTimeoutUs) {
-            // Brief yield so the Wi-Fi/idle tasks still run while we wait; the
-            // completion callback fires from the panel ISR, not this task.
-            delayMicroseconds(50);
-        }
-
-        if (!s_flush_done) {
-            s_flush_timeouts++;
-        }
-        s_flush_pending = false;
-
-        // Exactly ONE release per flush_cb call. Guarded so a spurious tick()
-        // with nothing pending cannot release a flush that never happened, which
-        // would desynchronise LVGL's outstanding-flush count.
-        if (s_registered_drv != nullptr) {
-            lv_disp_flush_ready(s_registered_drv);
-        }
-    }
-
+    // Do NOT move the release back here "once per tick". LVGL can flush more than
+    // one region between two calls to lv_timer_handler(), so releasing per tick
+    // releases too few times and permanently wedges LVGL's outstanding-flush
+    // counter — the UI then freezes (the digital clock was the first visible
+    // casualty) and the slowed loop makes HTTP requests time out.
     lv_timer_handler();
 }
 

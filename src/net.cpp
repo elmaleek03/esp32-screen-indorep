@@ -254,20 +254,137 @@ const char *statusLine() {
 // --- Time (NTP) -------------------------------------------------------------
 //
 // The standby clock is the only consumer. None of this runs on a hot path:
-// configTime() hands the work to the ESP-IDF SNTP client and returns, and
-// localTime() just reads the system clock.
+// serviceTimeSync() just checks a few cached values and, at most, re-issues
+// configTime(); localTime() only reads the system clock.
 //
 // The device has NO RTC and no battery, so time is lost on every power cycle.
 // That is why the UI needs an explicit "unsynced" state rather than assuming a
 // clock is available.
-static bool     s_timeSyncStarted = false;
+//
+// A small state, not one flag. An earlier revision used a single
+// s_timeSyncStarted latch and called configTime() exactly once, immediately on
+// connect — before DNS/sockets were ready. That is why the clock worked on some
+// boots and not others: if the one attempt failed, nothing retried it.
+//
+//   armed    -> beginTimeSync() was called (the link is up); NTP should sync
+//   attempts -> how many configTime() calls have been made (0 = not tried yet)
+//   ready    -> a plausible time has arrived; stop doing anything
+static bool     s_timeArmed       = false;
 static bool     s_timeReady       = false;
-static uint32_t s_timeSyncStart   = 0;
+static uint32_t s_timeAttemptMs   = 0;   // millis of the last configTime()
+static uint32_t s_timeArmedMs     = 0;   // millis when beginTimeSync() was called
+static uint32_t s_timeAttempts    = 0;   // number of configTime() calls made
+
+// Debounce for "the link is down". 0 = currently up.
+//
+// The Wi-Fi driver reports a non-connected status transiently (DHCP renew,
+// power-save wake), so a single bad sample must not be treated as a dropout —
+// see the comment in serviceTimeSync() for why that mattered.
+static uint32_t s_linkDownSince   = 0;
+static constexpr uint32_t kLinkDownGraceMs = 3000;
+
+// Last-resort re-arm window.
+//
+// IMPORTANT: we must NOT re-issue configTime() on a short cycle. configTime()
+// calls sntp_stop() then sntp_init(), i.e. it TEARS DOWN and restarts the SNTP
+// client. Called every few seconds while a sync is in flight it interrupts the
+// exchange before the reply arrives, and the clock then never syncs at all.
+// lwIP's SNTP client already polls continuously with backoff once started, so a
+// single call is normally enough and self-heals.
+//
+// So configTime() is called ONCE, after DNS is ready. Only if nothing has arrived
+// after this much longer window do we treat it as a lost socket and restart —
+// rarely, and late enough not to interrupt a slow but working sync.
+static constexpr uint32_t kTimeReArmMs = 60000;
+
+// Give DNS this long to become usable after the link is up before the first
+// attempt. A hostname NTP server cannot be resolved without it. If the platform
+// never reports a DNS server, we still attempt after this grace period (the
+// third server is a raw IP and needs no DNS).
+static constexpr uint32_t kTimeDnsGraceMs = 2000;
 
 void beginTimeSync() {
-    if (s_timeSyncStarted) return;
-    s_timeSyncStarted = true;
-    s_timeSyncStart = millis();
+    if (s_timeArmed) return;
+    s_timeArmed = true;
+    s_timeArmedMs = millis();
+
+    // Log the intent, not the fact: the actual configTime() happens in
+    // serviceTimeSync() once DNS is ready, so a failure there is visible rather
+    // than silent.
+    Serial.printf("[net] NTP armed (%s, %s, %s), TZ offset %+ld s\n",
+                  NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3,
+                  (long)NTP_TZ_OFFSET_S);
+}
+
+void serviceTimeSync() {
+    if (!s_timeArmed || s_timeReady) return;
+
+    // CHEAP GATE FIRST, then touch the Wi-Fi driver. These accessors take the
+    // ESP-IDF driver mutex and this runs on every loop pass, so the millis()
+    // check comes first and the driver is only read when an attempt is due.
+    //
+    // The FIRST attempt is not delayed at all: as soon as the caller has armed
+    // us the link is up, so we try immediately. Waiting a second here (as an
+    // earlier revision did) only created a window in which a transient Wi-Fi
+    // status blip could restart the countdown and keep configTime() from ever
+    // being reached. The DNS-readiness concern is handled separately below.
+    const bool firstAttempt = (s_timeAttempts == 0);
+    if (!firstAttempt && (millis() - s_timeAttemptMs) < kTimeReArmMs) return;
+
+    // While still on the first attempt, don't hammer the driver: probe at most
+    // every 250 ms until DNS is ready or the grace period expires. After that
+    // (or on a retry) the kTimeReArmMs gate above already spaces the reads out.
+    static uint32_t s_firstProbeMs = 0;
+    if (firstAttempt) {
+        if (s_firstProbeMs != 0 && (millis() - s_firstProbeMs) < 250) return;
+        s_firstProbeMs = millis();
+    }
+
+    // Read the driver ONCE and cache it. Used for both the down-check below and
+    // the DNS read further down.
+    const wl_status_t st = WiFi.status();
+
+    // Link health, using the module's own sticky notion of "connected" first.
+    //
+    // DISARMING IS DEBOUNCED, and this matters: the driver reports
+    // WL_DISCONNECTED / WL_IDLE_STATUS for brief moments during normal operation
+    // (DHCP renew, power-save wake). An earlier revision disarmed on ANY single
+    // non-connected pass and reset s_timeAttempts, which meant configTime() could
+    // be starved by blips and never called at all. So a blip must NOT drop the
+    // arm; only a sustained loss should.
+    if (st != WL_CONNECTED) {
+        if (s_linkDownSince == 0) {
+            s_linkDownSince = millis();
+            return;   // first blip: ignore, keep the arm
+        }
+        if (millis() - s_linkDownSince < kLinkDownGraceMs) {
+            return;   // still within the grace window: keep waiting
+        }
+        // Sustained: the link really is down. Drop the arm so a later connect can
+        // re-arm us; nothing to attempt until then.
+        s_timeArmed = false;
+        s_timeAttempts = 0;
+        s_timeAttemptMs = millis();
+        return;
+    }
+    // Link is up: reset the debounce.
+    s_linkDownSince = 0;
+
+    // On the FIRST attempt, prefer to wait for DNS so the hostname servers
+    // resolve. Bounded by the grace period, after which we attempt anyway.
+    const IPAddress dns = WiFi.dnsIP();
+    const bool haveDns = (dns[0] != 0 || dns[1] != 0);
+    if (firstAttempt && !haveDns && (millis() - s_timeArmedMs) < kTimeDnsGraceMs) {
+        return;
+    }
+
+    s_timeAttemptMs = millis();
+    s_timeAttempts++;
+
+    Serial.printf("[net] NTP %s #%lu (dns=%s%s)\n",
+                  firstAttempt ? "start" : "re-arm",
+                  (unsigned long)s_timeAttempts, dns.toString().c_str(),
+                  haveDns ? "" : " [NO DNS YET]");
 
     // TZ offset is passed in seconds, matching NTP_TZ_OFFSET_S (WIB, UTC+7).
     // Passing it here means getLocalTime() reports local time, so there is
@@ -279,22 +396,11 @@ void beginTimeSync() {
     // difference between "the clock is wrong" and "the clock works".
     configTime(NTP_TZ_OFFSET_S, NTP_TZ_DST_S,
                NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
-    Serial.printf("[net] NTP sync started (%s, %s, %s), TZ offset %+ld s\n",
-                  NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3,
-                  (long)NTP_TZ_OFFSET_S);
-
-    // Report the DNS server the stack is actually using. A missing or wrong DNS
-    // entry is the single most likely reason the hostname servers fail, so it is
-    // worth stating rather than leaving to inference.
-    const IPAddress dns = WiFi.dnsIP();
-    Serial.printf("[net] DNS for NTP lookups: %s%s\n",
-                  dns.toString().c_str(),
-                  (dns[0] == 0 && dns[1] == 0) ? "  (NONE SET - hostname NTP will fail)" : "");
 }
 
 bool timeReady() {
     if (s_timeReady) return true;
-    if (!s_timeSyncStarted) return false;
+    if (!s_timeArmed) return false;
 
     struct tm t = {};
     if (getLocalTime(&t, 0)) {
@@ -302,7 +408,9 @@ bool timeReady() {
         // land anywhere; anything outside this window must not be shown as time.
         if (t.tm_year >= (2024 - 1900) && t.tm_year <= (2099 - 1900)) {
             s_timeReady = true;
-            Serial.printf("[net] NTP synced: %04d-%02d-%02d %02d:%02d:%02d local\n",
+            Serial.printf("[net] NTP synced after %lu attempt(s): "
+                          "%04d-%02d-%02d %02d:%02d:%02d local\n",
+                          (unsigned long)s_timeAttempts,
                           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                           t.tm_hour, t.tm_min, t.tm_sec);
             return true;
@@ -318,8 +426,9 @@ bool timeReady() {
         time_t now = 0;
         time(&now);
         const IPAddress dns = WiFi.dnsIP();
-        Serial.printf("[net] NTP waiting: epoch=%ld dns=%s ip=%s rssi=%d\n",
-                      (long)now, dns.toString().c_str(), s_ip, (int)WiFi.RSSI());
+        Serial.printf("[net] NTP waiting: attempts=%lu epoch=%ld dns=%s ip=%s rssi=%d\n",
+                      (unsigned long)s_timeAttempts, (long)now,
+                      dns.toString().c_str(), s_ip, (int)WiFi.RSSI());
     }
     return false;
 }
