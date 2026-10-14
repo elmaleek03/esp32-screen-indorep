@@ -39,6 +39,10 @@ enum class ServerState : uint8_t {
 struct PaymentItem {
     char item[64];
     int  qty;
+    // Per-unit price in whole rupiah, as sent by the POS payload ("price").
+    // 0 when the payload omits it, in which case the QRIS page shows the qty
+    // without a price rather than a misleading "Rp 0".
+    int  price;
 };
 
 // Payload pushed by POST /update. Bounded so it can be held in a static buffer

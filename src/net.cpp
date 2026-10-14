@@ -1,10 +1,11 @@
 // net.cpp — Wi-Fi station bring-up for WARNET / CAFE / IDRP(debug).
 //
 // Behaviour notes:
-//  * The Go backend hardcodes http://192.168.4.254/, so when NET_STATIC_IP is
-//    enabled this applies a static address BEFORE begin(). Configuring after
-//    begin() is too late: DHCP would already have assigned something else and
-//    the backend's first request would time out.
+//  * The device takes its address from DHCP and uses it as-is. There is no
+//    static configuration: the earlier DHCP-then-static-fallback scheme to force
+//    192.168.4.252 conflicted with the router and left the device unreachable,
+//    so it was removed. The assigned address is reported on the connected screen
+//    and on /health.
 //  * An attempt has a hard deadline (WIFI_CONNECT_TIMEOUT_MS). Without it a
 //    wrong/absent AP leaves the UI spinning forever.
 //  * Retries are deliberately NOT automatic. A silent reconnect loop hides the
@@ -37,66 +38,10 @@ char      s_line[96] = "idle";
 // Station status captured at the moment of failure, used by failureReason().
 wl_status_t s_lastStatus = WL_IDLE_STATUS;
 
-// Effective IP policy for the current attempt (from NET_IP_MODE).
-int  s_ipMode      = NET_IP_MODE;
-// True once the static fallback has been applied for this attempt, so the DHCP
-// evaluation in poll() cannot oscillate between DHCP and static on every pass.
-bool s_usedFallback = false;
-
-// Claim NET_FALLBACK_ADDR statically. Returns true if the address was accepted.
-//
-// Called in two places: before begin() in static-only mode, and from poll() in
-// mode 1 once DHCP has returned an address that is NOT the one the backend
-// needs. Doing it late is the whole point of the fallback — DHCP gets first say,
-// so a working reservation is preferred over a hard-coded claim.
-bool applyStaticAddress() {
-    IPAddress ip, gw, mask;
-    if (!ip.fromString(NET_FALLBACK_ADDR) || !gw.fromString(NET_FALLBACK_GW) ||
-        !mask.fromString(NET_FALLBACK_MASK)) {
-        Serial.println("[net] ERROR: NET_FALLBACK_ADDR/GW/MASK did not parse!");
-        return false;
-    }
-
-    // A DNS server IS required, even though this device is primarily a server.
-    // The standby clock resolves its NTP servers by hostname, so without DNS the
-    // sync fails and the clock never updates - silently. NET_DNS_SERVER defaults
-    // to the gateway, which normally runs a resolver.
-    IPAddress dns;
-    const bool haveDns = dns.fromString(NET_DNS_SERVER);
-    if (!haveDns) {
-        Serial.printf("[net] WARNING: NET_DNS_SERVER \"%s\" did not parse; "
-                      "NTP hostname lookups will fail\n", NET_DNS_SERVER);
-    }
-
-    // WiFi.config() has several overloads; the 4-arg form adds a DNS server.
-    const bool ok = haveDns ? WiFi.config(ip, gw, mask, dns)
-                            : WiFi.config(ip, gw, mask);
-    if (!ok) {
-        Serial.println("[net] ERROR: static address REJECTED by the driver");
-        Serial.printf("[net]   requested %s/%s gw %s\n",
-                      NET_FALLBACK_ADDR, NET_FALLBACK_MASK, NET_FALLBACK_GW);
-        return false;
-    }
-
-    snprintf(s_ip, sizeof(s_ip), "%s", NET_FALLBACK_ADDR);
-    s_usedFallback = true;
-
-    Serial.printf("[net] static address claimed: %s gw %s mask %s dns %s\n",
-                  NET_FALLBACK_ADDR, NET_FALLBACK_GW, NET_FALLBACK_MASK,
-                  haveDns ? NET_DNS_SERVER : "(none)");
-
-    // Say plainly whether the backend can reach us, because this is the single
-    // most likely reason a correctly-installed device appears not to work.
-    if (strcmp(NET_FALLBACK_ADDR, NET_BACKEND_ADDR) == 0) {
-        Serial.println("[net]   backend target matches this address: OK");
-    } else {
-        Serial.printf("[net]   WARNING: the backend calls %s, this device is %s\n",
-                      NET_BACKEND_ADDR, NET_FALLBACK_ADDR);
-        Serial.println("[net]   the two must be bridged (e.g. a MikroTik dst-nat "
-                       "rule .254:80 -> this address) or the backend will time out");
-    }
-    return true;
-}
+// DHCP ONLY. The address is whatever the router leases; nothing here overrides
+// it. See board_config.h for why the earlier static-fallback scheme was retired.
+// (NET_FALLBACK_* symbols remain defined for the health endpoint, which reports
+// what the backend is configured to call, but they are never applied.)
 
 const char *passFor(NetChoice choice) {
     switch (choice) {
@@ -163,7 +108,6 @@ void beginConnect(NetChoice choice) {
     s_failed  = false;
     s_got_ip  = false;
     s_started = millis();
-    s_usedFallback = false;   // each attempt re-evaluates DHCP before falling back
     strncpy(s_ip, "0.0.0.0", sizeof(s_ip));
 
     // Ensure the STA interface exists before disconnecting, otherwise IDF logs
@@ -182,18 +126,12 @@ void beginConnect(NetChoice choice) {
         }
     }
 
-    s_ipMode = NET_IP_MODE;
-
-#if NET_IP_MODE == 2
-    // STATIC ONLY: claim the address before begin(), so DHCP never runs.
-    applyStaticAddress();
-#else
-    // DHCP (modes 0 and 1). In mode 1 a static fallback is applied later, from
-    // poll(), but only after DHCP has had its say — see the transition there.
-    Serial.printf("[net] DHCP mode%s\n",
-                  (NET_IP_MODE == 1) ? " with static fallback" : " (no fallback)");
-    Serial.printf("[net]   want %s for MAC %s\n", NET_BACKEND_ADDR, macString());
-#endif
+    // DHCP only: the router assigns the address and we use it as-is. Nothing is
+    // configured before WiFi.begin(), so the lease is the single source of truth
+    // and the connected screen reports exactly what the router handed out.
+    Serial.printf("[net] DHCP (address from the router)\n");
+    Serial.printf("[net]   STA MAC %s <- use this for a DHCP reservation if the "
+                  "backend needs a fixed address\n", macString());
 
     const char *ssid = ssidFor(choice);
     const char *pass = passFor(choice);
@@ -235,38 +173,19 @@ bool poll() {
     if (st == WL_CONNECTED) {
         refreshIp();
 
-        // --- Mode 1: DHCP got us an address. Is it the one the backend needs? --
+        // DHCP assigned us an address. Use it as-is: there is no static override
+        // any more (see board_config.h). The address is what the router handed
+        // out, and it is reported verbatim on the connected screen and /health.
         //
-        // This is the DHCP-then-static-fallback decision, and it happens HERE
-        // because it can only be made once DHCP has answered. If the lease is
-        // wrong, the device switches to the static fallback rather than sitting
-        // on an address nothing will ever talk to.
-        if (s_ipMode == 1 && !s_usedFallback) {
-            if (strcmp(s_ip, NET_BACKEND_ADDR) != 0) {
-                Serial.printf("[net] DHCP gave %s, but the backend calls %s\n",
-                              s_ip, NET_BACKEND_ADDR);
-                Serial.println("[net]   switching to the static fallback address");
-
-                // Drop the lease first: leaving a DHCP address configured while
-                // adding a static one is a guaranteed address conflict.
-                WiFi.disconnect(true, true);
-                delay(50);
-                if (applyStaticAddress()) {
-                    // Re-associate so the new address takes effect.
-                    //
-                    // Restart the timeout clock: this is a second association
-                    // attempt, and keeping the original deadline would make it
-                    // expire almost immediately after a slow first DHCP round.
-                    s_started = millis();
-                    WiFi.begin(ssidFor(s_choice),
-                               passFor(s_choice)[0] ? passFor(s_choice) : "");
-                    return false;   // still connecting; poll() will finish it
-                }
-                Serial.println("[net]   fallback FAILED; staying on the DHCP address");
-            } else {
-                Serial.printf("[net] DHCP gave the required address %s: no fallback needed\n",
-                              s_ip);
-            }
+        // If the Go backend cannot reach this device, that is a ROUTER or BACKEND
+        // configuration problem, not something the device can fix by claiming an
+        // address it does not own: pin the reservation by MAC, or repoint the
+        // backend. The log states the two addresses plainly so the comparison is
+        // immediate.
+        if (strcmp(s_ip, NET_BACKEND_ADDR) != 0) {
+            Serial.printf("[net] note: this device is %s but the backend calls %s; "
+                          "the router or the backend must bridge that\n",
+                          s_ip, NET_BACKEND_ADDR);
         }
 
         s_got_ip = true;
@@ -274,10 +193,9 @@ bool poll() {
         s_failed = false;
         // Read the descriptive fields only on the transition to connected, not
         // on every poll.
-        Serial.printf("[net] connected: ssid=\"%s\" ip=%s rssi=%d dBm ch=%d gw=%s%s\n",
+        Serial.printf("[net] connected: ssid=\"%s\" ip=%s rssi=%d dBm ch=%d gw=%s\n",
                       WiFi.SSID().c_str(), s_ip, (int)WiFi.RSSI(),
-                      (int)WiFi.channel(), WiFi.gatewayIP().toString().c_str(),
-                      s_usedFallback ? "  (static fallback)" : "");
+                      (int)WiFi.channel(), WiFi.gatewayIP().toString().c_str());
         rebuildLine();
         return true;
     }

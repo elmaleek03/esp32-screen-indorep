@@ -36,6 +36,14 @@
 //     permanently frozen UI. That bound is what makes this safe even if the two
 //     callbacks behave differently between the free-running and staged modes.
 //
+// REGRESSION NOTE: an intermediate revision replaced this with "release LVGL
+// immediately in flushCb(), because num_fbs = 2 makes it safe". That was wrong:
+// num_fbs rotates the PANEL's frame buffers, but there is only ONE LVGL DRAW
+// buffer, and with bounce buffers draw_bitmap() returns before the DMA has
+// finished reading it. The result was the panel showing a blend of two frames —
+// seen in the field as the status bar tearing and reappearing at the bottom of
+// the screen. Do not move the release back into flushCb().
+//
 // There is no mutex around the LVGL tree. LVGL v8 is not thread-safe and no lock
 // makes it so, so instead this firmware guarantees every widget access happens in
 // the main loop task: the web server never touches widgets, it publishes a
@@ -68,10 +76,12 @@ lv_color_t        *s_buf1 = nullptr;
 // object. tick() must release the flush through this pointer.
 lv_disp_drv_t     *s_registered_drv = nullptr;
 
-// Set from the panel's completion ISR. It is NOT on the critical path any more
-// (LVGL is released immediately in flushCb, which num_fbs = 2 makes safe); it is
-// kept because it is the only signal that the panel is genuinely still
-// transferring, which the health log reports.
+// Set from the panel's completion ISR, and cleared in flushCb() BEFORE the
+// transfer starts. tick() waits on this before releasing LVGL. It is the ONLY
+// signal that the DMA has finished reading the draw buffer.
+//
+// Starting true means the first flush after boot is not made to wait for a
+// callback that will never come.
 volatile bool s_flush_done = true;
 
 // Number of flushes LVGL has handed us since the last tick(). Recorded for the
@@ -81,6 +91,11 @@ uint32_t s_flush_outstanding = 0;
 bool     s_flush_pending    = false;
 uint32_t s_flush_started_us = 0;
 Stats    s_stats = {};
+
+// Flushes that hit the timeout in tick() without a completion interrupt. Should
+// stay at 0 in normal operation; a non-zero value means the panel's completion
+// callback is being missed and the UI is running one frame behind.
+uint32_t s_flush_timeouts = 0;
 
 // Why the glitch is diagnosable: record how MUCH is being flushed each time.
 // A "full screen" flush is 480x272; anything else is a partial update, and a
@@ -137,13 +152,17 @@ void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
     (void)drv;
 
     if (s_panel == nullptr) {
+        // Nothing to draw into: release immediately or LVGL stalls forever.
         lv_disp_flush_ready(drv);
         return;
     }
 
-    // Hand the buffer to the driver. With num_fbs = 2 this copies into the frame
-    // buffer the LCD_CAM is NOT currently scanning, so it is safe to return
-    // immediately and let LVGL keep working — there is nothing to wait for.
+    // ARM BEFORE STARTING. The completion callback can fire from the ISR as soon
+    // as the transfer begins (especially for a small partial update that the
+    // bounce-buffer DMA drains in microseconds). If we cleared the flag after
+    // calling draw_bitmap(), that completion would be swallowed and tick() would
+    // sit out the full timeout on every frame.
+    s_flush_done = false;
     s_flush_pending = true;
     s_flush_started_us = micros();
     s_stats.flushes++;
@@ -165,16 +184,18 @@ void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px);
 
-    // Release LVGL immediately. This is safe BECAUSE num_fbs = 2: the driver
-    // rotates between two frame buffers, so the buffer LVGL just filled is not
-    // the one the LCD_CAM is scanning, and LVGL may start the next render at
-    // once. Waiting here instead is what previously serialised the UI behind
-    // every frame and made an animated screen unresponsive.
+    // DO NOT call lv_disp_flush_ready() here.
     //
-    // Exactly ONE release per invocation: lv_disp_flush_ready() must be called
-    // once for every flush_cb call, no more and no fewer, or LVGL's internal
-    // outstanding-flush count desynchronises.
-    lv_disp_flush_ready(drv);
+    // `px` points into the ONE draw buffer (s_buf1). draw_bitmap() with bounce
+    // buffers only COPIES `px` into the bounce buffer and returns; the actual
+    // move into the frame buffer happens on DMA afterwards, reading `px` the
+    // whole time. Releasing LVGL now would let it render the very next frame into
+    // s_buf1 while that copy is still in flight — the panel then receives a mix
+    // of the old and new frames. Observed as the status bar being torn or
+    // duplicated lower down the panel.
+    //
+    // tick() waits for s_flush_done (bounded) and releases LVGL there, in task
+    // context, once the DMA has finished with the buffer.
 }
 
 }  // namespace
@@ -481,19 +502,37 @@ bool selfTest() {
 }
 
 void tick() {
-    // LVGL is released inside flushCb(), immediately after the buffer is handed
-    // to the panel, which is safe because num_fbs = 2 (see flushCb). So there is
-    // nothing to drain here — this function's only job is to run LVGL.
+    // Release the previous flush HERE, in task context, only after the DMA has
+    // finished reading the draw buffer. flushCb() deliberately does not release
+    // LVGL (see its comment): doing so let LVGL overwrite the draw buffer while
+    // the bounce-buffer DMA was still copying it, which tore the panel — most
+    // visibly the status bar appearing lower down the screen.
     //
-    // Historical note, because this is the third design to occupy this function
-    // and the reason matters: earlier versions waited here (up to 40 ms per
-    // flush) for the panel's completion callback before releasing LVGL. That
-    // serialised rendering AND input behind every frame. On any screen that
-    // animates — the connecting screen's spinner animates continuously — it
-    // stalled LVGL so badly that taps stopped registering and the flushes raced
-    // the panel's own scan, which looked like random glitching. Do not
-    // reintroduce a wait here.
-    s_flush_pending = false;
+    // The wait is BOUNDED. A lost or late completion interrupt must cost at most
+    // one late frame, never a frozen UI, so a timeout releases LVGL anyway and
+    // counts the event so it is visible in the health log.
+    if (s_flush_pending) {
+        constexpr uint32_t kFlushTimeoutUs = 30000;   // 30 ms ~ 1 frame at 33 Hz
+
+        while (!s_flush_done && (micros() - s_flush_started_us) < kFlushTimeoutUs) {
+            // Brief yield so the Wi-Fi/idle tasks still run while we wait; the
+            // completion callback fires from the panel ISR, not this task.
+            delayMicroseconds(50);
+        }
+
+        if (!s_flush_done) {
+            s_flush_timeouts++;
+        }
+        s_flush_pending = false;
+
+        // Exactly ONE release per flush_cb call. Guarded so a spurious tick()
+        // with nothing pending cannot release a flush that never happened, which
+        // would desynchronise LVGL's outstanding-flush count.
+        if (s_registered_drv != nullptr) {
+            lv_disp_flush_ready(s_registered_drv);
+        }
+    }
+
     lv_timer_handler();
 }
 
@@ -509,13 +548,19 @@ void logHealth() {
     // Report INTERNAL DRAM separately from total heap: the bounce buffers (in
     // the staged mode) and the Wi-Fi stack both live there, and a healthy total
     // heap can still hide internal-DRAM exhaustion.
+    //
+    // timeouts is the key field for the tearing fix: it is the number of flushes
+    // tick() released WITHOUT seeing the completion interrupt. In a healthy run
+    // it stays 0; if it climbs, the panel ISR is being missed and the flush is
+    // being released late (one frame behind), not early.
     Serial.printf("[lcd] health: flushes=%lu (full=%lu partial=%lu) "
-                  "outstanding=%lu last_area=%lu px scanning=%d "
+                  "outstanding=%lu timeouts=%lu last_area=%lu px scanning=%d "
                   "internal_free=%u KB (largest %u KB) psram_free=%u KB\n",
                   (unsigned long)s_stats.flushes,
                   (unsigned long)s_flush_full_cnt,
                   (unsigned long)s_flush_part_cnt,
                   (unsigned long)s_flush_outstanding,
+                  (unsigned long)s_flush_timeouts,
                   (unsigned long)s_flush_area_px,
                   s_flush_done ? 0 : 1,
                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),

@@ -199,42 +199,35 @@
 // ---------------------------------------------------------------------------
 // Networking
 // ---------------------------------------------------------------------------
-// The Go backend (indorep_backend_v2/display/display.go) hardcodes
-//   http://192.168.4.254/
-// so in the intended deployment THIS DEVICE must own 192.168.4.254.
+// The device takes its address from DHCP. The router assigns it and the device
+// shows the result on the "Terhubung!" (connected) screen, so the operator can
+// read the live address off the panel without a serial console.
 //
-// HOW THE ADDRESS IS OBTAINED (NET_IP_MODE)
+// WHY DHCP ONLY
 //
-//   0 = DHCP ONLY. Ask the router and use whatever it gives. Correct if you have
-//       set up a DHCP reservation for this device's MAC. If the router does not
-//       hand back .254 the backend will NOT find the device (it fails silently
-//       with a 5 s timeout on every /update), so this mode is only safe once the
-//       reservation is confirmed working.
+//   An earlier revision tried to force a fixed address (DHCP-then-static
+//   fallback to 192.168.4.252) to satisfy a backend that hardcodes
+//   192.168.4.254. That static path did not work reliably here: the fallback
+//   address is often already in use (or outside the router's lease pool), so the
+//   claim conflicted and the device ended up unreachable — the exact failure it
+//   was meant to prevent. DHCP is what actually works on this network, so the
+//   static machinery is retired.
 //
-//   1 = DHCP, THEN STATIC FALLBACK  (current setting)
-//       Ask DHCP first. If the lease does not give the required address, the
-//       device releases it and claims NET_FALLBACK_ADDR itself, so it is always
-//       reachable on a known address instead of sitting on a random one.
+// CONSEQUENCE FOR THE BACKEND
 //
-//   2 = STATIC ONLY. Claim NET_FALLBACK_ADDR immediately, never run DHCP.
-//       Use when you want the device pinned with no router cooperation at all.
-//
-// WHY THE FALLBACK IS .252 AND NOT .254 ON THIS NETWORK
-//
-//   .254 is already occupied by another host here, so the device must not claim
-//   it — two hosts on one address breaks both of them intermittently, and it is
-//   the kind of fault that looks like "the network is flaky" rather than an
-//   obvious misconfiguration.
-//
-//   The consequence is important and must be understood: while the device is on
-//   .252, the Go backend CANNOT reach it, because the backend only ever calls
-//   .254. Something must bridge the two — on MikroTik, a destination-NAT rule
-//   forwarding tcp/80 on .254 to .252. See docs/BRINGUP.md section 11.
-//
-//   Alternatively, retire whatever holds .254 and switch NET_FALLBACK_ADDR back
-//   to "192.168.4.254" so the backend works with no extra router rules.
-#define NET_IP_MODE          1
+//   The Go backend (indorep_backend_v2/display/display.go) hardcodes
+//   http://192.168.4.254/. Because this device now sits on a DHCP address, the
+//   backend can only reach it if one of these is true:
+//     * the router's DHCP reservation gives this device's MAC the address the
+//       backend expects (recommended — read the MAC off the connected screen or
+//       the boot log and pin it), or
+//     * the backend is repointed at the DHCP address shown on the device.
+//   The device cannot solve this from its side; it just reports its address.
+#define NET_IP_MODE          0
 
+// Retained so net.cpp still compiles its (now unused at mode 0) static helpers
+// and so the health endpoint can name the address the backend is configured to
+// call. NOT applied to the interface any more.
 #define NET_FALLBACK_ADDR    "192.168.4.252"
 #define NET_FALLBACK_GW      "192.168.4.1"
 #define NET_FALLBACK_MASK    "255.255.255.0"

@@ -220,14 +220,19 @@ void serviceSerialConsole() {
                      "51440014ID.CO.QRIS.WWW0215ID10200212345670303U"
                      "MI5204581253033605802ID5920TOKO TEST INDOREP6007JAKARTA"
                      "61051234062070703A016304ABCD");
-            snprintf(demo.total, sizeof(demo.total), "Rp 15 000");
+            snprintf(demo.total, sizeof(demo.total), "Rp 15.000");
             demo.item_count = 3;
-            snprintf(demo.items[0].item, sizeof(demo.items[0].item), "Kopi Susu");
+            // Each item carries a per-unit price now, so the panel's two-line
+            // "Nx Rp unit / name" layout is exercised locally.
+            snprintf(demo.items[0].item, sizeof(demo.items[0].item), "ujang - Paket Bocah");
             demo.items[0].qty = 1;
-            snprintf(demo.items[1].item, sizeof(demo.items[1].item), "Paket Malam");
+            demo.items[0].price = 7000;
+            snprintf(demo.items[1].item, sizeof(demo.items[1].item), "nadia - Paket Malam");
             demo.items[1].qty = 1;
-            snprintf(demo.items[2].item, sizeof(demo.items[2].item), "Roti Bakar");
+            demo.items[1].price = 5000;
+            snprintf(demo.items[2].item, sizeof(demo.items[2].item), "Kopi Susu");
             demo.items[2].qty = 2;
+            demo.items[2].price = 1500;
             demo.has_qr = true;
             ui::showQris(demo);
             break;
@@ -352,7 +357,7 @@ void serviceNetwork() {
         const bool ok = web::begin();
         s_serverStarted = ok;
         s_ntpStarted = false;   // allow the sync to start for this new link
-        ui::showSummary(net::activeSsid(), ok);
+        ui::showSummary(net::activeSsid(), net::ipString(), ok);
         Serial.printf("[boot] web server %s\n", ok ? "RUNNING" : "FAILED");
         return;
     }

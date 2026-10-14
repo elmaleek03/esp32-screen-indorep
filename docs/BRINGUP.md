@@ -482,62 +482,33 @@ discovery and no fallback.
 
 ### How this firmware gets an address
 
-`NET_IP_MODE` in `board_config.h`:
+**DHCP only.** The device runs no static configuration and claims no fixed
+address: the router leases it an address and the device uses that address as-is.
+The assigned address is shown on the "Terhubung!" (connected) screen, printed on
+the serial boot log, and reported by `/health`.
 
-| Mode | Behaviour |
-|---|---|
-| 0 | DHCP only. Use whatever the router gives. Safe **only** once a reservation for this MAC is confirmed. |
-| **1** | **DHCP first, then static fallback (current).** If the lease is not the address the backend needs, the device releases it and claims `NET_FALLBACK_ADDR` itself. |
-| 2 | Static only. Never runs DHCP. |
+This replaced an earlier DHCP-then-static-fallback scheme (`NET_IP_MODE 1`, which
+forced `192.168.4.252`). That scheme did not work reliably on this network — the
+fallback address was frequently already in use or outside the router's lease
+pool, so the claim conflicted and the device became unreachable, the very failure
+it was meant to prevent. DHCP is what works, so the static machinery is gone
+(`NET_IP_MODE` is now `0`).
 
-Current settings: `NET_IP_MODE 1`, `NET_FALLBACK_ADDR "192.168.4.252"`.
+### The consequence for the backend, stated plainly
 
-### Why the fallback is `.252` and not `.254`
+The Go backend calls **only** `192.168.4.254:80`. This device now sits on a
+**DHCP-assigned** address, so unless something makes those two coincide, the
+backend cannot reach it. The firmware deliberately does **not** report this as an
+error: it shows its own IP and the address the backend expects, in muted grey,
+and stops there. The device cannot know whether the backend has been repointed or
+whether something forwards `.254:80` here, so it states the fact rather than
+blaming itself for a network/routing problem it cannot see.
 
-**`.254` is occupied by another host on this network** (a second unit of this
-same product, MAC `34:CD:B0:10:AE:FC`). Two hosts on one address breaks both
-intermittently, in a way that looks like general flakiness rather than a
-configuration error. So this device must not claim `.254`, and the fallback is
-`.252`.
+### How to make the backend reach the device — pick one
 
-**The consequence, stated plainly:** the Go backend calls `.254`, this device is
-on `.252`, so **the two numbers differ**. Whether traffic actually arrives is a
-routing question, and the answer has nothing to do with this firmware.
-
-**The firmware deliberately does NOT report this as an error.** The CONFIRM
-screen shows the target as `192.168.4.254 (different)`, in muted grey rather than
-red. The firmware cannot know whether the backend has been repointed, or whether
-something forwards `.254:80` here, so it shows the fact and stops there. An
-earlier revision printed a red "UNREACHABLE from backend!" — that was removed
-because it blamed a healthy device for a network problem the device cannot see.
-
-### Two ways to fix it — pick one
-
-**Option A — bridge the two addresses on the MikroTik (no reflash).**
-
-Destination-NAT everything the backend sends to `.254:80` over to `.252:80`:
-
-```
-/ip firewall nat
-add chain=dstnat protocol=tcp dst-address=192.168.4.254 dst-port=80 \
-    action=dst-nat to-addresses=192.168.4.252 to-ports=80 \
-    comment="indorep qris display: backend .254 -> device .252"
-```
-
-The backend keeps using `.254` untouched and the device keeps `.252`. Note this
-requires whatever currently holds `.254` to not also answer on port 80.
-
-**Option B — free up `.254` and let the device have it (preferred).**
-
-Find and retire the current `.254` holder, then set the fallback back to the
-address the backend expects so no router rule is needed:
-
-```c
-#define NET_FALLBACK_ADDR    "192.168.4.254"
-```
-
-Even better, once you have confirmed it works, make the router responsible and
-stop claiming addresses at all:
+**Option A — reserve the address the backend already uses (preferred, no code
+change).** Pin this device's MAC to `192.168.4.254` in the router's DHCP server,
+so DHCP hands back the address the backend expects:
 
 ```
 /ip dhcp-server lease
@@ -545,19 +516,39 @@ add address=192.168.4.254 mac-address=CC:BA:97:02:BA:D8 \
     comment="indorep qris display"
 ```
 
-...and set `NET_IP_MODE 0` (DHCP only). Get the MAC from the panel's CONFIRM
-screen, the boot log, or by pressing `m` in the serial console.
+Get the MAC from the connected screen, the boot log, or by pressing `m` in the
+serial console. This requires `.254` to be free — if another host holds it, that
+host must be retired first (two hosts on one address breaks both).
+
+**Option B — repoint the backend at the device's DHCP address (no router rule).**
+Read the device's IP off the connected screen (or `/health`) and change the
+backend's `url` to match. Simplest when you control the backend deployment, but
+the address can change on the next lease unless you also reserve it.
+
+**Option C — bridge the two addresses on the MikroTik (no reflash, no backend
+change).** Destination-NAT everything the backend sends to `.254:80` over to
+whatever the device's DHCP address is:
+
+```
+/ip firewall nat
+add chain=dstnat protocol=tcp dst-address=192.168.4.254 dst-port=80 \
+    action=dst-nat to-addresses=<device-dhcp-ip> to-ports=80 \
+    comment="indorep qris display: backend .254 -> device DHCP addr"
+```
+
+The address in `to-addresses` must be kept in sync with the lease (reserve it),
+so Option A is usually less to maintain.
 
 ### Checking it worked
 
 From **inside the backend's network** (not from a machine on `192.168.4.x`):
 
 ```bash
-curl -v --max-time 5 http://192.168.4.252/health
+curl -v --max-time 5 http://<device-ip>/health      # <device-ip> from the panel
 ```
 
 ```json
-{"ok":true,"mac":"CC:BA:97:02:BA:D8","ip":"192.168.4.252",
+{"ok":true,"mac":"CC:BA:97:02:BA:D8","ip":"192.168.4.132",
  "backend_addr":"192.168.4.254","same_as_backend":false, ...}
 ```
 
@@ -570,7 +561,7 @@ fault is inter-subnet routing (see the note below), not this device.
 If even the **router itself** times out pinging the display:
 
 ```
-/ping 192.168.4.252          # from the MikroTik over SSH/Winbox
+/ping <device-ip>             # from the MikroTik over SSH/Winbox
 ```
 
 ...then the device is not the problem and no firmware change will help. Check,
@@ -585,7 +576,7 @@ in this order:
    `192.168.5.0/24 -> 192.168.4.0/24` on port 80 must exist in the **forward**
    chain (not `input`), above any drop rule, and its counter should increment
    when the backend tries.
-4. `/ping 192.168.4.252 interface=<lan-iface>` — if forcing the interface works
+4. `/ping <device-ip> interface=<lan-iface>` — if forcing the interface works
    but the plain ping does not, the router is choosing the wrong source
    interface: a routing-table/interface-membership problem.
 

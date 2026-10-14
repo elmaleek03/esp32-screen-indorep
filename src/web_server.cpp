@@ -96,10 +96,14 @@ void handleUpdate() {
         }
         const char *name = item["item"] | "";
         const int qty = item["qty"] | 0;
+        // Per-unit price. Optional: an older POS that does not send it leaves
+        // this 0 and the UI shows the quantity only (see showQris()).
+        const int price = item["price"] | 0;
         if (name[0] == '\0') continue;
         snprintf(p.items[p.item_count].item,
                  sizeof(p.items[p.item_count].item), "%s", name);
         p.items[p.item_count].qty = qty;
+        p.items[p.item_count].price = price;
         p.item_count++;
     }
 

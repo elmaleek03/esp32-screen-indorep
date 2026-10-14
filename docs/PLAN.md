@@ -200,10 +200,13 @@ esp32-screen-indorep/
 ## 7. Networking notes
 
 - Credentials are compile-time constants in `include/wifi_profiles.h`.
-- The Go backend hardcodes `192.168.4.254`, so the shipped firmware should
-  **force a static IP 192.168.4.254 / 255.255.255.0 / gw 192.168.4.1** on the
-  chosen AP. During bring-up DHCP is used and the assigned IP is shown on the
-  CONFIRM screen and serial log.
+- The device takes its address from **DHCP** and uses it as-is; there is no
+  static configuration. The assigned IP is shown on the connected ("Terhubung!")
+  screen, printed in the boot log, and reported by `/health`.
+- The Go backend hardcodes `192.168.4.254`, so for it to reach the device either
+  reserve that address for this device's MAC, repoint the backend at the DHCP
+  address shown on screen, or bridge the two with a router `dst-nat` rule. See
+  `docs/BRINGUP.md` section 11.
 - Ports: HTTP on **80**.
 
 ---

@@ -17,7 +17,8 @@ is that display.
 
 The M0 bring-up (`boot menu + colour bars + touch dot`) has been **replaced** by
 the complete product flow, including the `M1` UI, `M2` web server and on-device
-QR rendering. `M3` hardening is partially in: static IP is now the default.
+QR rendering. `M3` hardening is partially in: the device takes a DHCP address
+and reports it on the connected screen (no static configuration).
 
 ---
 
@@ -271,7 +272,7 @@ Module responsibilities and, more importantly, the reason each boundary exists:
 | `src/ui_screens.cpp/.h` | The five screens, drawn once at boot and shown/hidden. | Avoids allocating/freeing widgets during transitions. |
 | `src/qr_render.cpp/.h` | QRIS string → LVGL `lv_qrcode` canvas. | Isolates the QR encoder and its LVGL-heap budget. |
 | `src/web_server.cpp/.h` | `/update`, `/reset`, `/health`; payload mailbox. | Never touches LVGL; publishes and returns (§6.3). |
-| `src/net.cpp/.h` | Station connect, static IP, failure classification. | Keeps Wi-Fi policy out of the UI. |
+| `src/net.cpp/.h` | Station connect (DHCP), IP reporting, failure classification. | Keeps Wi-Fi policy out of the UI. |
 
 Removed: `src/touch_bus.cpp/.h` (superseded by `gt911_i2c`).
 
@@ -284,7 +285,7 @@ Removed: `src/touch_bus.cpp/.h` (superseded by `gt911_i2c`).
 | Backlight | GPIO2 driven high early, before the self-test, so the pattern is visible. |
 | LVGL | 8.4.0, full-screen single PSRAM draw buffer (261 KB), default dark theme. |
 | Touch | **GT911 identified on hardware**: `0x5D: product id "911"`, config committed (xmax=480 ymax=272, cksum=0x9F). A real menu tap was observed: `[ui] menu tap -> "IDRP"`. |
-| Wi-Fi | Scans and lists APs; connects; **static IP 192.168.4.254 by default** so the Go backend works unchanged. |
+| Wi-Fi | Connects to the chosen AP; takes a **DHCP address** and reports it on the connected screen and `/health` (no static configuration). |
 | Web server | `/update`, `/reset`, `/health` implemented with a non-blocking mailbox hand-off. |
 | QR | On-device encoding via LVGL's `lv_qrcode`; 216x216 canvas (5840 B). Local test page available by pressing `q` in the console. |
 | Build | Clean, **zero warnings**, ~16 s; 119 KB RAM (36.3 %), 1.20 MB flash (18.3 %). |
@@ -439,7 +440,7 @@ a QR before creating the widget), which needs an explicit include path to LVGL's
 | **M0** | Boot, RGB screen, touch, Wi-Fi bring-up | ✅ Screen (after the §6.5 fix), touch proven on hardware, Wi-Fi ✅ |
 | **M1** | Real UI: boot menu → connecting → confirm → standby, QRIS page | ✅ implemented |
 | **M2** | Web server `/update` + `/reset`, on-device QR rendering | ✅ implemented |
-| **M3** | Static IP 192.168.4.254, `/health`, diagnostics | ✅ static IP + `/health` + diagnostics done; **automatic reconnection not implemented** (see §11) |
+| **M3** | Address reporting, `/health`, diagnostics | ✅ DHCP + IP on connected screen + `/health` + diagnostics done; **automatic reconnection not implemented** (see §11) |
 
 ### Product flow (implemented)
 

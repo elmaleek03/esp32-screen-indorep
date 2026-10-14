@@ -58,20 +58,57 @@ constexpr uint32_t kDim     = 0x606078;
 // a working touchscreen gives obvious feedback on contact.
 constexpr uint32_t kBtnPressed = 0xF0F0FF;
 
+// --- Light theme (QRIS / payment page) -------------------------------------
+//
+// The payment page is shown to a CUSTOMER holding a phone, not to the operator,
+// so it uses a light theme: a white page reads as a receipt/payment screen and
+// gives the QR maximum contrast in a bright room. The dark theme above stays for
+// the operator-facing screens (chooser, connecting, summary, standby).
+//
+// These are deliberately only used by the QRIS page construction and by the
+// per-bar theming in statusBar()/setWifiBar(); nothing else should reach for
+// them, so a future global theme change cannot silently bleed light colours into
+// the dark screens.
+constexpr uint32_t kLightBg       = 0xFFFFFF;   // page background: pure white
+constexpr uint32_t kLightText     = 0x101018;   // primary text (near-black)
+constexpr uint32_t kLightMuted    = 0x6A6A78;   // secondary text
+constexpr uint32_t kLightGood     = 0x118A4A;   // total price: dark green on white
+constexpr uint32_t kLightBad      = 0xC02020;   // error text: dark red on white
+constexpr uint32_t kLightBarBg    = 0xF2F2F6;   // status bar: very light grey
+constexpr uint32_t kLightBarRule  = 0xD5D5DE;   // bar divider
+constexpr uint32_t kLightBarFg    = 0x30303C;   // bar text
+
 constexpr lv_coord_t kBarH = UI_STATUS_BAR_H;
 
 // QRIS page geometry. Namespace scope because showQris() needs the canvas size
 // to report an encode shortfall against the real size. The canvas is FIXED:
 // lv_qrcode allocates its buffer in the constructor and cannot be resized.
 //
-// The canvas is 196 px and qr::create() adds a 10 px white quiet zone on each
-// side, so the object occupies 216 px on screen and the black modules are never
-// flush with its edge. Ends at y = 44 + 216 = 260, leaving a 12 px margin.
-constexpr int kQrCanvas = 196;
+// The page heading ("Pembayaran QRIS") lives in the STATUS BAR, not the body, so
+// the QR and the item list start right under the bar and the body is used
+// entirely for content. The QR is the right-hand column; the item list is the
+// left. The total price sits BELOW the QR, so the QR+total stack must fit the
+// panel height (272) under the bar (26).
+//
+// kQrY is deliberately ABOVE the bar's bottom edge: the top kQrQuiet pixels of
+// the QR object are blank white quiet zone, so tucking a few pixels of it under
+// the bar loses nothing visible and lifts the code (and everything below it)
+// higher on the panel.
+constexpr int kQrCanvas = 176;
 constexpr int kQrQuiet  = 10;
-constexpr int kQrSize   = kQrCanvas + 2 * kQrQuiet;   // on-screen footprint, 216
-constexpr int kQrX      = kW - kQrSize - 12;
-constexpr int kQrY      = kBarH + 18;
+constexpr int kQrSize   = kQrCanvas + 2 * kQrQuiet;   // on-screen footprint, 196
+constexpr int kQrX      = kW - kQrSize - 12;          // right column x
+constexpr int kQrY      = kBarH - 6;                  // lift the QR into the bar's quiet zone
+
+// The total sits under the QR, nudged right of the QR column's left edge so it
+// reads as a right-hand block rather than aligned with the item list.
+constexpr int kTotalXShift = 20;
+
+// Left column layout. No indent: the list is the page's primary content now that
+// the heading lives in the status bar.
+constexpr int kListX     = 24;                 // left margin of the item list
+constexpr int kListRight = 8;                  // gap between list and QR column
+constexpr int kListW     = kQrX - kListX - kListRight;
 
 Screen s_current  = Screen::BOOT_SCREEN;
 bool   s_latched  = false;   // route committed; WIFI_SELECT is unreachable
@@ -94,6 +131,11 @@ struct StatusBarRefs {
     lv_obj_t *icon  = nullptr;
     lv_obj_t *slash = nullptr;
     lv_obj_t *ssid  = nullptr;
+    // True when this bar belongs to a light-themed page (the QRIS page). The
+    // colours setWifiBar() pushes depend on it: the "connected" green and the
+    // "no wifi" grey that read well on the dark chrome are too pale on a white
+    // bar, so each bar carries its own theme rather than sharing one palette.
+    bool      light = false;
 };
 StatusBarRefs s_bars[kMaxBars];
 uint8_t       s_barCount = 0;
@@ -121,6 +163,7 @@ lv_obj_t *s_connectStat = nullptr;
 // --- summary ---
 lv_obj_t *s_summary   = nullptr;
 lv_obj_t *s_sumSsid   = nullptr;
+lv_obj_t *s_sumIp     = nullptr;
 lv_obj_t *s_sumServer = nullptr;
 
 // --- home ---
@@ -136,18 +179,31 @@ lv_obj_t *s_handS     = nullptr;
 // --- qris ---
 lv_obj_t *s_qris    = nullptr;
 lv_obj_t *s_qrObj   = nullptr;
-lv_obj_t *s_qrItems = nullptr;
-lv_obj_t *s_qrTotal = nullptr;
-lv_obj_t *s_qrTitle = nullptr;
+lv_obj_t *s_qrTotal = nullptr;        // the price value, below the QR
+// The item list is a fixed pool of rows, built once at boot and filled per
+// payload. Each row is two labels (price line + name line), so an item never
+// needs a widget allocated at runtime — that would be heap churn during a
+// payment, against the "build once" rule this file follows.
+//
+// The count is bounded by the vertical space between the bar and the total
+// price. Rows are 34 px tall and start at kBarH + 6 (32); the total sits at
+// kQrY + kQrSize + 2 (= 218), so five rows end at 202 and leave a clean gap.
+// A sixth would run its name line into the total, so five is the ceiling.
+constexpr uint8_t kItemRows = 5;
+struct ItemRow {
+    lv_obj_t *qtyPrice = nullptr;   // line 1: "2x   Rp 5.000"
+    lv_obj_t *name     = nullptr;   // line 2: "ujang - Paket Bocah"
+};
+ItemRow s_itemRows[kItemRows];
 
 // --- helpers ---------------------------------------------------------------
 
-lv_obj_t *blankPage(lv_obj_t *parent) {
+lv_obj_t *blankPage(lv_obj_t *parent, uint32_t bg = kBg) {
     lv_obj_t *page = lv_obj_create(parent);
     lv_obj_remove_style_all(page);
     lv_obj_set_size(page, kW, kH);
     lv_obj_set_pos(page, 0, 0);
-    lv_obj_set_style_bg_color(page, lv_color_hex(kBg), 0);
+    lv_obj_set_style_bg_color(page, lv_color_hex(bg), 0);
     lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
     lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
     // A page is a BACKGROUND, not a target. lv_obj_create() is clickable by
@@ -166,6 +222,43 @@ lv_obj_t *label(lv_obj_t *parent, const char *text, lv_coord_t x, lv_coord_t y,
     if (font != nullptr) lv_obj_set_style_text_font(l, font, 0);
     lv_obj_set_pos(l, x, y);
     return l;
+}
+
+// Format a whole-rupiah amount with dot thousands separators into `out`, e.g.
+// 5000 -> "5.000". Indonesian convention uses "." as the thousands separator,
+// matching how prices read on the panel (the app's own total uses ",").
+//
+// Writes at most `n` bytes including the terminator; a too-small buffer simply
+// truncates. No allocation: this runs inside showQris(), which must not churn the
+// heap during a payment.
+void formatThousands(int value, char *out, size_t n) {
+    if (out == nullptr || n == 0) return;
+
+    // Work on the absolute value, then re-apply the sign (prices are positive,
+    // but this stays correct if a negative ever arrives).
+    const bool neg = value < 0;
+    unsigned int v = neg ? (unsigned int)(-value) : (unsigned int)value;
+
+    char digits[16];
+    snprintf(digits, sizeof(digits), "%u", v);
+
+    size_t o = 0;
+    if (neg && o < n - 1) out[o++] = '-';
+    const int len = (int)strlen(digits);
+    for (int i = 0; i < len && o < n - 1; i++) {
+        if (i > 0 && ((len - i) % 3) == 0 && o < n - 1) out[o++] = '.';
+        if (o < n - 1) out[o++] = digits[i];
+    }
+    out[o] = '\0';
+}
+
+// Show a QR failure message in place of the total, in red. Used when the payload
+// cannot be encoded at all — the total is meaningless without a QR to pay into,
+// so it is replaced rather than left showing a number the customer cannot use.
+void showQrError(const char *text) {
+    if (s_qrTotal == nullptr || text == nullptr) return;
+    lv_label_set_text(s_qrTotal, text);
+    lv_obj_set_style_text_color(s_qrTotal, lv_color_hex(kLightBad), 0);
 }
 
 // Action sentinels that cannot collide with NetChoice (which is 0..3).
@@ -245,12 +338,21 @@ void hideAll() {
 
 // Build the shared top status bar into `page`. Called for every page except the
 // boot log, which owns the whole screen.
-void statusBar(lv_obj_t *page) {
+//
+// `light` selects the light chrome used by the payment (QRIS) page; every other
+// page keeps the dark chrome. The flag is also recorded per bar so setWifiBar()
+// can pick compatible foreground colours later (the bar has no text to read back
+// once built).
+//
+// `rightText`, when non-null, is drawn right-aligned in the same bar row (used
+// by the QRIS page for its "Pembayaran QRIS" heading, which lives here rather than in
+// the page body so the whole body is free for the item list).
+void statusBar(lv_obj_t *page, bool light = false, const char *rightText = nullptr) {
     lv_obj_t *bar = lv_obj_create(page);
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, kW, kBarH);
     lv_obj_set_pos(bar, 0, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(UI_STATUS_BAR_BG), 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(light ? kLightBarBg : UI_STATUS_BAR_BG), 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
     // Decorative strip, not a target: it spans the full width and would
     // otherwise sit in the input chain over the top of the page.
@@ -261,7 +363,7 @@ void statusBar(lv_obj_t *page) {
     lv_obj_remove_style_all(rule);
     lv_obj_set_size(rule, kW, 1);
     lv_obj_set_pos(rule, 0, kBarH - 1);
-    lv_obj_set_style_bg_color(rule, lv_color_hex(0x2A2A3C), 0);
+    lv_obj_set_style_bg_color(rule, lv_color_hex(light ? kLightBarRule : 0x2A2A3C), 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     lv_obj_clear_flag(rule, LV_OBJ_FLAG_CLICKABLE);
 
@@ -288,15 +390,28 @@ void statusBar(lv_obj_t *page) {
     lv_obj_t *slash = lv_line_create(bar);
     lv_line_set_points(slash, slashPts, 2);
     lv_obj_set_style_line_width(slash, 2, 0);
-    lv_obj_set_style_line_color(slash, lv_color_hex(kBad), 0);
+    lv_obj_set_style_line_color(slash, lv_color_hex(light ? kLightBad : kBad), 0);
     lv_obj_clear_flag(slash, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(slash, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *ssid = lv_label_create(bar);
     lv_label_set_text(ssid, "no wifi");
-    lv_obj_set_style_text_color(ssid, lv_color_hex(UI_STATUS_BAR_FG), 0);
+    lv_obj_set_style_text_color(ssid, lv_color_hex(light ? kLightBarFg : UI_STATUS_BAR_FG), 0);
     lv_obj_set_style_text_font(ssid, &lv_font_montserrat_14, 0);
     lv_obj_align(ssid, LV_ALIGN_LEFT_MID, 46, 0);
+
+    // Optional right-aligned heading in the same bar row. On the QRIS page this
+    // is "Pembayaran QRIS": putting it here instead of the page body frees the whole
+    // body area for the item list, which is the tightest resource on the page.
+    if (rightText != nullptr) {
+        lv_obj_t *right = lv_label_create(bar);
+        lv_label_set_text(right, rightText);
+        lv_obj_set_style_text_color(right,
+                                    lv_color_hex(light ? kLightBarFg : UI_STATUS_BAR_FG), 0);
+        // 16 px so it reads as a heading, but still fits within the 26 px bar.
+        lv_obj_set_style_text_font(right, &lv_font_montserrat_16, 0);
+        lv_obj_align(right, LV_ALIGN_RIGHT_MID, -12, 0);
+    }
 
     // Register this page's copy so setWifiBar() updates ALL of them, not just
     // the last one built. See the StatusBarRefs comment for why this matters.
@@ -304,6 +419,7 @@ void statusBar(lv_obj_t *page) {
         s_bars[s_barCount].icon  = icon;
         s_bars[s_barCount].slash = slash;
         s_bars[s_barCount].ssid  = ssid;
+        s_bars[s_barCount].light = light;
         s_barCount++;
     } else {
         // Should not happen (5 pages, 6 slots), but say so rather than silently
@@ -574,8 +690,14 @@ void build() {
     s_sumSsid = label(s_summary, "-", 0, 0, kGood, &lv_font_montserrat_16);
     lv_obj_align(s_sumSsid, LV_ALIGN_TOP_MID, 0, kBarH + 88);
 
+    // The DHCP-assigned address, shown so the operator (and the backend) can read
+    // the device's live IP straight off the panel. This is the number to put in a
+    // router reservation or to point the backend at, so it gets its own line.
+    s_sumIp = label(s_summary, "IP -", 0, 0, kText, &lv_font_montserrat_16);
+    lv_obj_align(s_sumIp, LV_ALIGN_TOP_MID, 0, kBarH + 116);
+
     s_sumServer = label(s_summary, "-", 0, 0, kMuted, &lv_font_montserrat_14);
-    lv_obj_align(s_sumServer, LV_ALIGN_TOP_MID, 0, kBarH + 112);
+    lv_obj_align(s_sumServer, LV_ALIGN_TOP_MID, 0, kBarH + 142);
 
     // Large Continue. Pressing it latches the route permanently.
     makeButton(s_summary, "Lanjut", kW / 2 - 110, kH - 20 - 56, 220, 56,
@@ -629,30 +751,65 @@ void build() {
                          &lv_font_montserrat_32);
 
     // ---------------- QRIS ----------------
-    s_qris = blankPage(s_scr);
-    statusBar(s_qris);
-    s_qrTitle = label(s_qris, "QRIS", 24, kBarH + 10, kText,
-                      &lv_font_montserrat_16);
+    // LIGHT THEME. Unlike every other screen this one faces the CUSTOMER, so it
+    // is a white receipt-style page: maximum QR contrast in a bright counter
+    // environment, and it reads as a payment screen rather than device chrome.
+    // The background is white and every text element below is recoloured for a
+    // white page; the shared status bar is built in its light variant, and it
+    // carries the "Pembayaran QRIS" heading so the body is free for the item list.
+    s_qris = blankPage(s_scr, kLightBg);
+    statusBar(s_qris, true, "Pembayaran QRIS");
 
     // The CANVAS size is passed, not the on-screen footprint: qr::create() adds
     // the quiet-zone padding itself. Passing kQrSize here would double it.
     s_qrObj = qr::create(s_qris, kQrX + kQrQuiet, kQrY + kQrQuiet, kQrCanvas);
 
-    s_qrItems = lv_label_create(s_qris);
-    lv_label_set_text(s_qrItems, "");
-    lv_obj_set_style_text_color(s_qrItems, lv_color_hex(kText), 0);
-    // 12 px: the cart can be several lines, and the font must be small enough
-    // that the longest realistic basket still fits the left column.
-    lv_obj_set_style_text_font(s_qrItems, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(s_qrItems, 20, kBarH + 32);
-    lv_obj_set_width(s_qrItems, kQrX - 30);
-    lv_label_set_long_mode(s_qrItems, LV_LABEL_LONG_WRAP);
+    // Item rows: a fixed pool, two lines each. The first line carries the
+    // quantity and unit price, the second the name/member. All built hidden;
+    // showQris() reveals the ones a payload has and fills them.
+    //
+    // There is no divider between rows: it cost vertical pitch for little gain,
+    // and on a light page the two-line blocks already read as separate entries.
+    //
+    // The list starts BELOW the status bar (kBarH), not at kQrY: the QR is
+    // allowed to tuck into the bar's area because its top is blank quiet zone,
+    // but text must not overlap the bar. So the list gets its own top padding.
+    constexpr lv_coord_t kRowH    = 34;   // vertical pitch of one item
+    constexpr lv_coord_t kListTop = kBarH + 6;  // first row's top, under the bar
+    constexpr lv_coord_t kLine1Y  = 0;    // qty/price line offset within a row
+    constexpr lv_coord_t kLine2Y  = 16;   // name line offset within a row
+    for (uint8_t i = 0; i < kItemRows; i++) {
+        const lv_coord_t rowY = kListTop + (lv_coord_t)i * kRowH;
+        ItemRow &r = s_itemRows[i];
 
+        // Line 1: quantity and unit price, the heavier of the two lines.
+        r.qtyPrice = label(s_qris, "", kListX, rowY + kLine1Y, kLightText,
+                           &lv_font_montserrat_14);
+        lv_obj_set_width(r.qtyPrice, kListW);
+        lv_label_set_long_mode(r.qtyPrice, LV_LABEL_LONG_CLIP);
+
+        // Line 2: name (and member for billing lines), muted so the price line
+        // stays the visual anchor.
+        r.name = label(s_qris, "", kListX, rowY + kLine2Y, kLightMuted,
+                       &lv_font_montserrat_12);
+        lv_obj_set_width(r.name, kListW);
+        lv_label_set_long_mode(r.name, LV_LABEL_LONG_DOT);
+
+        // Start hidden; showQris() decides what to show per payload.
+        lv_obj_add_flag(r.qtyPrice, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(r.name, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Total value, BELOW the QR code. No "Total:" caption: the size and the
+    // green colour make it self-evident, and the freed line keeps the item list
+    // room. It is the largest text on the page because it is the number the
+    // customer checks before paying.
     s_qrTotal = lv_label_create(s_qris);
     lv_label_set_text(s_qrTotal, "");
-    lv_obj_set_style_text_color(s_qrTotal, lv_color_hex(kGood), 0);
-    lv_obj_set_style_text_font(s_qrTotal, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(s_qrTotal, 20, kQrY + kQrSize - 22);
+    lv_obj_set_style_text_color(s_qrTotal, lv_color_hex(kLightGood), 0);
+    lv_obj_set_style_text_font(s_qrTotal, &lv_font_montserrat_32, 0);
+    // Under the QR column, nudged right so it reads as a right-hand block.
+    lv_obj_set_pos(s_qrTotal, kQrX + kTotalXShift, kQrY + kQrSize + 2);
 
     showBootScreen();
 }
@@ -709,10 +866,20 @@ void setConnectingStatus(const char *text) {
     lv_label_set_text(s_connectStat, text);
 }
 
-void showSummary(const char *ssid, bool serverOk) {
+void showSummary(const char *ssid, const char *ip, bool serverOk) {
     if (s_sumSsid) lv_label_set_text(s_sumSsid, ssid ? ssid : "-");
 
-    // Server state is the only technical line left on this screen. It is shown
+    // The DHCP-assigned address. This is the headline fact on this screen now
+    // that the device no longer claims a fixed IP: it is what the operator reads
+    // off the panel to find the device, and what the backend must be pointed at
+    // (or reserved for by MAC).
+    if (s_sumIp) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "IP %s", (ip && ip[0]) ? ip : "-");
+        lv_label_set_text(s_sumIp, buf);
+    }
+
+    // Server state is the only other technical line on this screen. It is shown
     // because a FAILED HTTP server means the device will never receive a
     // payment, and that is worth one line of screen before the operator commits.
     if (s_sumServer) {
@@ -748,21 +915,68 @@ void showQris(const PaymentPayload &payload) {
         Serial.println("[ui] route latched implicitly by showQris()");
     }
 
-    if (s_qrItems) {
-        char buf[512];
-        int n = 0;
-        if (payload.item_count == 0) {
-            n += snprintf(buf + n, sizeof(buf) - n, "(tanpa rincian item)\n");
+    // --- item rows ---------------------------------------------------------
+    //
+    // Each row is two lines: "Nx   Rp unit" then the name/member. Rows beyond
+    // what the payload carries (or beyond the fixed pool) stay hidden. A cart
+    // longer than the pool is truncated with a trailing "+N lagi" line so the
+    // operator is never misled into thinking a partial list is complete.
+    int row = 0;
+    for (int i = 0; i < payload.item_count && row < kItemRows; i++, row++) {
+        const PaymentItem &it = payload.items[i];
+        ItemRow &r = s_itemRows[row];
+
+        if (r.qtyPrice != nullptr) {
+            char line1[40];
+            if (it.price > 0) {
+                // Thousands-separated rupiah, e.g. "2x   Rp 5.000".
+                char price[20];
+                formatThousands(it.price, price, sizeof(price));
+                snprintf(line1, sizeof(line1), "%dx   Rp %s", it.qty, price);
+            } else {
+                // No price in the payload (older POS): quantity only, rather
+                // than a misleading "Rp 0".
+                snprintf(line1, sizeof(line1), "%dx", it.qty);
+            }
+            lv_label_set_text(r.qtyPrice, line1);
+            lv_obj_clear_flag(r.qtyPrice, LV_OBJ_FLAG_HIDDEN);
         }
-        for (int i = 0; i < payload.item_count && n < (int)sizeof(buf) - 48; i++) {
-            n += snprintf(buf + n, sizeof(buf) - n, "%s  x%d\n",
-                          payload.items[i].item, payload.items[i].qty);
+        if (r.name != nullptr) {
+            lv_label_set_text(r.name, it.item[0] ? it.item : "-");
+            lv_obj_clear_flag(r.name, LV_OBJ_FLAG_HIDDEN);
         }
-        lv_label_set_text(s_qrItems, buf);
+    }
+
+    // Overflow marker: if there are still items after the pool is full, show
+    // "+N lagi" in the name line of the last row so the list is honestly partial.
+    if (payload.item_count > row && row > 0) {
+        ItemRow &last = s_itemRows[row - 1];
+        char more[24];
+        snprintf(more, sizeof(more), "+%d lagi", payload.item_count - (row - 1));
+        if (last.name != nullptr) lv_label_set_text(last.name, more);
+    }
+
+    // Hide any rows the payload did not use, so a shorter cart after a longer
+    // one does not leave stale text on screen.
+    for (int i = row; i < kItemRows; i++) {
+        ItemRow &r = s_itemRows[i];
+        if (r.qtyPrice) lv_obj_add_flag(r.qtyPrice, LV_OBJ_FLAG_HIDDEN);
+        if (r.name)     lv_obj_add_flag(r.name, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (payload.item_count == 0) {
+        // Empty cart (cash-style summary): say so in the first row rather than
+        // showing a blank list.
+        ItemRow &r = s_itemRows[0];
+        if (r.qtyPrice) lv_obj_add_flag(r.qtyPrice, LV_OBJ_FLAG_HIDDEN);
+        if (r.name) {
+            lv_label_set_text(r.name, "(tanpa rincian item)");
+            lv_obj_clear_flag(r.name, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     if (s_qrTotal) {
         lv_label_set_text(s_qrTotal, payload.total[0] ? payload.total : "");
+        lv_obj_set_style_text_color(s_qrTotal, lv_color_hex(kLightGood), 0);
     }
 
     if (payload.has_qr) {
@@ -776,19 +990,18 @@ void showQris(const PaymentPayload &payload) {
         if (wantPx <= 0) {
             Serial.println("[ui] payload exceeds QR capacity");
             qr::setVisible(s_qrObj, false);
-            if (s_qrTitle) lv_label_set_text(s_qrTitle, "QR GAGAL DIBUAT");
+            showQrError("QR GAGAL DIBUAT");
         } else if (qr::update(s_qrObj, payload.qr)) {
             qr::setVisible(s_qrObj, true);
-            if (s_qrTitle) lv_label_set_text(s_qrTitle, "SCAN UNTUK BAYAR");
         } else {
             Serial.printf("[ui] QR encode failed (wanted %dpx in a %dpx canvas)\n",
                           wantPx, kQrCanvas);
             qr::setVisible(s_qrObj, false);
-            if (s_qrTitle) lv_label_set_text(s_qrTitle, "QR GAGAL DIBUAT");
+            showQrError("QR GAGAL DIBUAT");
         }
     } else {
+        // Cash-style summary: no QR, just the cart and the total.
         qr::setVisible(s_qrObj, false);
-        if (s_qrTitle) lv_label_set_text(s_qrTitle, "TOTAL BAYAR");
     }
 
     show(s_qris, Screen::QRIS);
@@ -813,8 +1026,13 @@ void setWifiBar(bool connected, const char *ssid) {
         StatusBarRefs &b = s_bars[i];
 
         if (b.icon) {
-            lv_obj_set_style_text_color(b.icon,
-                                        lv_color_hex(connected ? kGood : kMuted), 0);
+            // Per-bar theme: the green/grey pair that reads well on the dark
+            // chrome is too pale against the light QRIS bar, so the light bar
+            // gets a darker green and a mid grey.
+            const uint32_t iconCol = connected
+                                         ? (b.light ? kLightGood : kGood)
+                                         : (b.light ? kLightMuted : kMuted);
+            lv_obj_set_style_text_color(b.icon, lv_color_hex(iconCol), 0);
         }
         if (b.slash) {
             // The slash is the "off" indicator: shown only while disconnected.

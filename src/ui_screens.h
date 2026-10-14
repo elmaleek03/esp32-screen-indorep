@@ -44,10 +44,10 @@ void showConnecting(const char *ssid);
 // Association failed. Returns to WIFI_SELECT with a red banner naming the cause.
 void showConnectFailed(const char *ssid, const char *reason);
 
-// Big green check, wifi info (no IP, no MAC), and a Continue button. Pressing
-// Continue LATCHES the route: WIFI_SELECT becomes unreachable for the life of
-// this boot.
-void showSummary(const char *ssid, bool serverOk);
+// Big green check, wifi info (SSID + DHCP-assigned IP), server state, and a
+// Continue button. Pressing Continue LATCHES the route: WIFI_SELECT becomes
+// unreachable for the life of this boot.
+void showSummary(const char *ssid, const char *ip, bool serverOk);
 
 // The standby homescreen: analog clock + branch name. Only reachable after the
 // route is latched.
