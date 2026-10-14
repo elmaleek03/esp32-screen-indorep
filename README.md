@@ -3,9 +3,7 @@
 Firmware for a 4.3" ESP32-S3 counter display that shows the active QRIS payment
 (QR code + cart summary + total) to a customer. It is a small HTTP server: the
 Indorep POS backend pushes a payment to it, and it renders the result on the
-panel. It replaces the placeholder display the Go backend
-(`indorep_backend_v2`) and the Flutter billing app (`indorep_billing_v2`)
-already talk to.
+panel.
 
 ## Hardware
 
