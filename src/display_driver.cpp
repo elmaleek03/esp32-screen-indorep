@@ -36,6 +36,18 @@
 //     permanently frozen UI. That bound is what makes this safe even if the two
 //     callbacks behave differently between the free-running and staged modes.
 //
+// FULL REFRESH is enabled on the LVGL driver (disp_drv.full_refresh = 1). That is
+// the setting whose absence caused the intermittent tearing: without it LVGL
+// renders in CHUNKS and hands flushCb() partial rectangles, and a partial write
+// into a free-running frame buffer tears against the scanout — visible as a band
+// of the old frame (typically the status bar) left at a different place on the
+// screen. With it, every flushCb() is a whole frame and the two draw buffers
+// behave as classic double buffering, which is the configuration LVGL's porting
+// guide prescribes for an MCU that has an LCD controller peripheral. Do not try
+// to emulate it by widening the area inside flushCb(); that was tried and is
+// worse, because LVGL keeps rendering the next chunk into the buffer the widened
+// transfer is still reading.
+//
 // REGRESSION NOTE: an intermediate revision replaced this with "release LVGL
 // immediately in flushCb(), because num_fbs = 2 makes it safe". That was wrong:
 // num_fbs rotates the PANEL's frame buffers, but there is only ONE LVGL DRAW
@@ -70,6 +82,10 @@ esp_lcd_panel_handle_t s_panel = nullptr;
 
 lv_disp_draw_buf_t s_draw_buf;
 lv_color_t        *s_buf1 = nullptr;
+// Second LVGL draw buffer. Required by full_refresh + two-buffer double
+// buffering: LVGL renders into one while the DMA drains the other, so a
+// full-frame transfer cannot be overwritten mid-flight.
+lv_color_t        *s_buf2 = nullptr;
 
 // The driver LVGL actually registered. Kept for the health log; flushCb()
 // receives its own drv pointer, so the release no longer needs to round-trip
@@ -310,15 +326,26 @@ bool begin() {
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
 
-    // --- LVGL draw buffer in PSRAM ----------------------------------------
-    // Full-screen single buffer: one refresh is one transfer, so a dropped
-    // flush cannot leave half the screen stale (the old "quarter screen" bug).
-    // 480 * 272 * 2 = 261 KB, which this 8 MB PSRAM module has to spare.
+    // --- LVGL draw buffers in PSRAM ---------------------------------------
+    // TWO full-screen buffers (261 KB each, 522 KB total from an 8 MB pool).
+    // full_refresh + two screen-sized buffers is the configuration LVGL's porting
+    // guide prescribes for an MCU with an LCD controller peripheral (see the
+    // disp_drv.full_refresh comment below). LVGL alternates them per frame, so
+    // the DMA can drain one while LVGL renders into the other.
     const size_t px = (size_t)LCD_WIDTH * LCD_HEIGHT;
     s_buf1 = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t),
                                            MALLOC_CAP_SPIRAM);
     if (s_buf1 == nullptr) {
-        Serial.println("[lcd] PSRAM draw buffer alloc FAILED");
+        Serial.println("[lcd] PSRAM draw buffer 1 alloc FAILED");
+        return false;
+    }
+    s_buf2 = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t),
+                                           MALLOC_CAP_SPIRAM);
+    if (s_buf2 == nullptr) {
+        // Fatal: full_refresh on a single buffer is the combination that tears.
+        // Refuse to start rather than run in a known-bad configuration.
+        Serial.println("[lcd] PSRAM draw buffer 2 alloc FAILED - full_refresh "
+                       "needs two buffers");
         return false;
     }
 
@@ -338,13 +365,14 @@ bool begin() {
     // that one is still uninitialised the panel flashes white for a frame. Push
     // the black frame once per frame buffer.
     memset(s_buf1, 0x00, px * sizeof(lv_color_t));
+    memset(s_buf2, 0x00, px * sizeof(lv_color_t));
     Serial.printf("[lcd] priming %u frame buffer(s) with black (%u px each)\n",
                   (unsigned)LCD_CFG_NUM_FBS, (unsigned)px);
     for (size_t i = 0; i < LCD_CFG_NUM_FBS; i++) {
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, s_buf1);
     }
 
-    lv_disp_draw_buf_init(&s_draw_buf, s_buf1, nullptr, px);
+    lv_disp_draw_buf_init(&s_draw_buf, s_buf1, s_buf2, px);
 
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
@@ -352,6 +380,37 @@ bool begin() {
     disp_drv.ver_res  = LCD_HEIGHT;
     disp_drv.flush_cb = flushCb;
     disp_drv.draw_buf = &s_draw_buf;
+
+    // --- full_refresh: the setting whose absence caused the tearing -----------
+    // LVGL's porting guide (4.3inch_ESP32-4827S043/1-Demo/Demo_Arduino/
+    // Libraries/Lvgl/docs/porting/display.md) is explicit:
+    //
+    //   "LVGL might render the screen in multiple chunks and therefore call
+    //    flush_cb multiple times."
+    //
+    // Without full_refresh, flushCb() receives dirty CHUNKS, never whole frames.
+    // A partial write into a FREE-RUNNING PSRAM frame buffer lands at an arbitrary
+    // scan position, so the panel shows part of the old frame and part of the new
+    // one: the top band tearing and reappearing at the bottom. That was the
+    // intermittent glitch reported on this board and on its sibling project.
+    //
+    // The same guide names the correct configuration for this hardware:
+    //
+    //   "If full_refresh is enabled and two screen sized draw buffers are
+    //    provided, LVGL's display handling works like 'traditional' double
+    //    buffering. This means the flush_cb callback only has to update the
+    //    address of the framebuffer. ... This configuration should be used if the
+    //    MCU has an LCD controller peripheral."
+    //
+    // The ESP32-S3 has one (LCD_CAM), so this is the intended mode, not a
+    // workaround. Verified on hardware in the sibling cooktaker project, where
+    // the health log went from "full 0 part 63" (every flush partial) to whole
+    // frames and the glitch disappeared.
+    //
+    // DO NOT emulate this by widening the area inside flushCb(). That was tried
+    // and made it worse: LVGL kept rendering the next CHUNK into the buffer the
+    // widened transfer was still reading.
+    disp_drv.full_refresh = 1;
 
     // lv_disp_drv_register() returns the lv_disp_t and stores its OWN copy of
     // the driver struct. That copy is what the flush callback receives, so this
@@ -365,7 +424,8 @@ bool begin() {
     s_registered_drv = disp->driver;
 
     Serial.printf("[lcd] panel ready: %dx%d @ %u Hz, refresh=%s, fbs=%u, "
-                  "bounce=%u lines (%u KB DRAM), PSRAM draw buffer %u KB\n",
+                  "bounce=%u lines (%u KB DRAM), full_refresh=1, "
+                  "PSRAM draw buffers 2 x %u KB\n",
                   LCD_WIDTH, LCD_HEIGHT, (unsigned)LCD_PCLK_HZ,
                   LCD_MODE_NAME, (unsigned)LCD_CFG_NUM_FBS,
                   (unsigned)LCD_BOUNCE_LINES,
